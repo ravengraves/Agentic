@@ -444,6 +444,15 @@ class AgentStreamingTask(threading.Thread):
             sublime.set_timeout(self._finalize, 0)
             return
 
+        # Auto-compact if context exceeds 70% of model limit
+        if self.messages and model.get("auto_compact"):
+            est_tokens = sum(len(m.get("content", "")) for m in self.messages) // 4
+            context_limit = model.get("context", 128000)
+            if est_tokens > context_limit * 0.7:
+                _printstatus("Compacting context ({:.0f}% used)...".format(
+                    float(est_tokens) / context_limit * 100))
+                self.messages = _compact_history(self.messages, model)
+
         ## Estimate and print usage based on elapsed time
         if not tps:
             tps = model.get("speed", float("NaN"))
@@ -872,6 +881,34 @@ class AgenticClearReasoningCommand(sublime_plugin.TextCommand):
         cleaned = _rebuild_text(messages)
         view.replace(edit, sublime.Region(0, view.size()), cleaned)
         sublime.status_message("Chat reasoning cleared")
+
+
+class AgenticCompactCommand(sublime_plugin.WindowCommand):
+    """Compact chat history via LLM summarization, overwriting the view."""
+    def run(self):
+        view = self.window.active_view()
+        if not view or not view.settings().get("agentic_is_chat"):
+            return
+        if view.settings().get("agentic_is_streaming"):
+            self.window.run_command("cancel_stream")
+
+        text = view.substr(sublime.Region(0, view.size()))
+        messages = _build_messages_from_text(text)
+        if not messages or len(messages) < 4:
+            return
+
+        models = sublime.load_settings("Agentic.sublime-settings").get("models")
+        model_name = view.settings().get("agent_model")
+        model = models.get(model_name, {}) if model_name else _pick_model()
+        if not model_name:
+            model_name = _pick_model()
+            model = models.get(model_name, {})
+
+        compacted = _compact_history(messages, model)
+        rebuilt = _rebuild_text(compacted)
+        view.run_command("select_all")
+        view.run_command("insert", {"characters": rebuilt + "\n\n# --- User ---\n"})
+        _printstatus("Chat compacted")
 
 
 class AgenticActionCommand(sublime_plugin.WindowCommand):

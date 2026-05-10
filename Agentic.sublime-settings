@@ -1,6 +1,6 @@
 {
 	// Default values that the user can override
-	"default_prompt": "You are an expert programming agent. Focus on correctness and simplicity.",
+	"default_prompt": "You are an expert coding agent with read, patch, grep, find, ls, and python tools. Take direct action -- read files before editing, verify changes, explore with find/grep/ls instead of guessing. Make minimal correct changes. Be concise. When errors occur, re-read the file and try again.",
 	"default_models": "models_high",
 
 	// These models are good for most programming tasks but can be slow:
@@ -20,6 +20,9 @@
 
 	// Load AGENTS.md from project folder and inject into system prompt
 	"enable_agents_md": false,
+
+	// Automatically compact context with LLM summarization when above 70% of model context limit
+	"auto_compact": false,
 
 	// output streaming status and est. cost to console ([ctrl] + [`])
 	"console_log": false,
