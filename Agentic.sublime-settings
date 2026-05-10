@@ -18,6 +18,9 @@
 	// Sanitize ALL model outputs (breaks caching)
 	"sanitize_output": false,
 
+	// Load AGENTS.md from project folder and inject into system prompt
+	"enable_agents_md": false,
+
 	// output streaming status and est. cost to console ([ctrl] + [`])
 	"console_log": false,
 
