@@ -128,8 +128,12 @@ def chat_stream(messages, model, cancel=None, tools=None):
                     if mm:
                         name = mm.group(1).strip()
                         args = mm.group(2) if mm.group(2) else "{}"
-                        yield ("__tool_calls__", [{"id": "tc_0", "function": {"name": name, "arguments": args}}])
-                        return
+                        try:
+                            json.loads(args)
+                            yield ("__tool_calls__", [{"id": "tc_0", "function": {"name": name, "arguments": args}}])
+                            return
+                        except (ValueError, Exception):
+                            pass
             yield (False, content)
         if m.get("tool_calls"):
             yield ("__tool_calls__", [{"id": tc["id"], "function": {"name": tc["function"]["name"], "arguments": tc["function"]["arguments"]}} for tc in m["tool_calls"]])
@@ -193,7 +197,11 @@ def chat_stream(messages, model, cancel=None, tools=None):
                     if m:
                         name = m.group(1).strip()
                         args = m.group(2) if m.group(2) else "{}"
-                        yield ("__tool_calls__", [{"id": "tc_0", "function": {"name": name, "arguments": args}}])
+                        try:
+                            json.loads(args)
+                            yield ("__tool_calls__", [{"id": "tc_0", "function": {"name": name, "arguments": args}}])
+                        except (ValueError, Exception):
+                            yield (False, _content_buf[:end + len("<tool_call|>")])
                     _content_buf = _content_buf[end + len("<tool_call|>"):]
                 elif not delta:
                     if choice.get("finish_reason") == "tool_calls" and tool_accums:

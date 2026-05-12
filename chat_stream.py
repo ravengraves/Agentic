@@ -197,8 +197,12 @@ def chat_stream(messages, model, cancel=None, tools=None):
                     if mm:
                         name = mm.group(1).strip()
                         args = mm.group(2) if mm.group(2) else "{}"
-                        yield ("__tool_calls__", [{"id": "tc_0", "function": {"name": name, "arguments": args}}])
-                        return
+                        try:
+                            json.loads(args)
+                            yield ("__tool_calls__", [{"id": "tc_0", "function": {"name": name, "arguments": args}}])
+                            return
+                        except (ValueError, Exception):
+                            pass
             yield (False, content)
 
         # Tool calls in non-streaming response
@@ -283,7 +287,11 @@ def chat_stream(messages, model, cancel=None, tools=None):
                     if m:
                         name = m.group(1).strip()
                         args = m.group(2) if m.group(2) else "{}"
-                        yield ("__tool_calls__", [{"id": "tc_0", "function": {"name": name, "arguments": args}}])
+                        try:
+                            json.loads(args)
+                            yield ("__tool_calls__", [{"id": "tc_0", "function": {"name": name, "arguments": args}}])
+                        except (ValueError, Exception):
+                            yield (False, _content_buf[:end + len("<tool_call|>")])
                     _content_buf = _content_buf[end + len("<tool_call|>"):]
                 elif not delta:  # Final timing report or tool_calls finish
                     if choice.get("finish_reason") == "tool_calls" and tool_accums:
@@ -342,15 +350,8 @@ class AgentStreamingTask(threading.Thread):
             if folders:
                 cwd = folders[0]
 
-        self._write("\n\n# --- Agent ---\n")
-        sublime.set_timeout(
-            lambda: self.view.run_command(
-                "move_to", {"to": "eof", "extend": False}), 0)
-
         if self.view.settings().get("agent_model") is None:
-            self.view.settings().set(
-                "agent_model",
-                _pick_model())
+            self.view.settings().set("agent_model", _pick_model())
 
         # Load latest model settings
         models = sublime.load_settings("Agentic.sublime-settings").get("models")
@@ -371,6 +372,7 @@ class AgentStreamingTask(threading.Thread):
                 tool_calls = None
                 prev_reasoning = False
                 streamed_content = ""
+                self._write("\n\n# --- Agent ---\n")
                 for chunk in chat_stream(self.messages, model, self._cancel_event, tools=tooling):
                     if isinstance(chunk, tuple) and chunk[0] == "__tool_calls__":
                         tool_calls = chunk[1]
