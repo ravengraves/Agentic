@@ -12,6 +12,7 @@ import sys
 import time
 import json
 import glob
+import shutil
 import atexit
 import difflib
 import signal
@@ -234,43 +235,44 @@ TOOLS = [
 #  Persistent Python REPL subprocess (NDJSON protocol)
 # -------------------------------------------------------------
 
-_REPL_EXE = sys.executable
-_repl_proc = None
-_repl_lock = threading.Lock()
-_REPL_TIMEOUT = 30
+def _find_python():
+    exe = shutil.which("python3") or shutil.which("python") or sys.executable
+    return exe
+
+_REPL_EXE = _find_python()
+_repl_sessions = {}            # session_id -> {"proc": Popen, "lock": Lock}
+_repl_sessions_lock = threading.Lock()
+_REPL_EXEC_TIMEOUT = 30
 
 
 def _cleanup_repl():
-    """Terminate the REPL subprocess on plugin unload or process exit."""
-    global _repl_proc
-    if _repl_proc is not None:
-        try:
-            _repl_proc.stdin.close()
-        except (OSError, AttributeError):
-            pass
-        try:
-            _repl_proc.terminate()
-            _repl_proc.wait(timeout=3)
-        except Exception:
+    """Terminate all REPL subprocesses on plugin unload or process exit."""
+    with _repl_sessions_lock:
+        for state in list(_repl_sessions.values()):
             try:
-                _repl_proc.kill()
-            except OSError:
+                state["proc"].stdin.close()
+            except Exception:
                 pass
-        _repl_proc = None
-
+            try:
+                state["proc"].terminate()
+                state["proc"].wait(timeout=2)
+            except Exception:
+                try:
+                    state["proc"].kill()
+                except Exception:
+                    pass
+        _repl_sessions.clear()
 
 atexit.register(_cleanup_repl)
 
 
 def _get_repl_script_path():
-    """Return the absolute path to the REPL server script bundled alongside this module."""
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "_repl.py")
 
 
 def _start_repl():
-    """Launch the persistent REPL subprocess. Returns the Popen object."""
-    global _repl_proc
-    _repl_proc = subprocess.Popen(
+    """Launch a REPL subprocess. Returns the Popen object."""
+    return subprocess.Popen(
         [_REPL_EXE, _get_repl_script_path()],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
@@ -278,104 +280,103 @@ def _start_repl():
         bufsize=0,
         cwd=os.getcwd(),
     )
-    # Drain any startup noise on stderr (protocol uses JSON on stdout only)
-    return _repl_proc
 
 
-def _ensure_repl():
-    """Make sure the REPL subprocess is alive; restart if necessary."""
-    with _repl_lock:
-        if _repl_proc is None:
-            return _start_repl()
-        rv = _repl_proc.poll()
-        if rv is not None:
-            return _start_repl()
-        return _repl_proc
+def _repl_for_session(session_id):
+    """Get or create the REPL for a session. Auto-restarts dead processes."""
+    with _repl_sessions_lock:
+        state = _repl_sessions.get(session_id)
+        if state is None or state["proc"].poll() is not None:
+            state = {
+                "proc": _start_repl(),
+                "lock": threading.Lock(),
+            }
+            _repl_sessions[session_id] = state
+        return state
 
 
-def _send_to_repl(cmd_dict):
-    """
-    Send a NDJSON command to the REPL subprocess and read the next NDJSON response.
-    Returns (stdout_text, error_flag).
-    """
-    global _repl_proc
+def _send_to_repl(session_id, cmd_dict, cancel=None):
+    """Send a NDJSON command. Returns (stdout_text, error_flag)."""
+    state = _repl_for_session(session_id)
+    with state["lock"]:
+        proc = state["proc"]
 
-    proc = _ensure_repl()
+        if cancel and cancel.is_set():
+            return "python error: cancelled", True
 
-    payload = json.dumps(cmd_dict) + "\n"
-    try:
-        proc.stdin.write(payload.encode("utf-8"))
-        proc.stdin.flush()
-    except (BrokenPipeError, OSError):
-        # Pipe broken -> restart inside lock
-        with _repl_lock:
-            _repl_proc = None
-        proc = _ensure_repl()
-        proc.stdin.write(payload.encode("utf-8"))
-        proc.stdin.flush()
-
-    # Read response line by line until we get a valid JSON protocol message
-    start_time = time.time()
-    partial = b""
-    while True:
-        if time.time() - start_time > _REPL_TIMEOUT:
-            try:
-                proc.terminate()
-                proc.wait(timeout=2)
-            except Exception:
-                try:
-                    proc.kill()
-                except OSError:
-                    pass
-            return (
-                "python error: execution timed out after 30s. "
-                "Simplify the code or split into smaller chunks.",
-                True,
-            )
-
+        payload = json.dumps(cmd_dict) + "\n"
         try:
-            byte = proc.stdout.read(1)
-        except (IOError, OSError):
-            break
+            proc.stdin.write(payload.encode("utf-8"))
+            proc.stdin.flush()
+        except (BrokenPipeError, OSError):
+            with _repl_sessions_lock:
+                _repl_sessions.pop(session_id, None)
+            state = _repl_for_session(session_id)
+            proc = state["proc"]
+            proc.stdin.write(payload.encode("utf-8"))
+            proc.stdin.flush()
 
-        if byte == b"":
-            # EOF -- process died
-            with _repl_lock:
-                _repl_proc = None
-            return (
-                "python error: subprocess died unexpectedly. "
-                "It will be restarted on next call.",
-                True,
-            )
-
-        partial += byte
-
-        if b"\n" in partial:
-            line_end = partial.index(b"\n")
-            line = partial[:line_end].decode("utf-8", errors="replace").strip()
-            partial = partial[line_end + 1:]
-
-            if not line:
-                continue
+        start_time = time.time()
+        partial = b""
+        while True:
+            if cancel and cancel.is_set():
+                proc.terminate()
+                return "python error: cancelled", True
+            if time.time() - start_time > _REPL_EXEC_TIMEOUT:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=2)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except OSError:
+                        pass
+                with _repl_sessions_lock:
+                    _repl_sessions.pop(session_id, None)
+                return (
+                    "python error: execution timed out after 30s. "
+                    "Simplify the code or split into smaller chunks.",
+                    True,
+                )
 
             try:
-                resp = json.loads(line)
-            except (json.JSONDecodeError, ValueError):
-                continue  # not a protocol line; ignore
+                byte = proc.stdout.read(1)
+            except (IOError, OSError):
+                break
 
-            rtype = resp.get("type")
-            if rtype == "result":
-                output = resp.get("stdout", "")
-                err = resp.get("error")
-                if err:
-                    if output:
-                        output = output + "\n"
-                    output = output + "Error: " + err
-                return output, False
-            elif rtype == "error":
-                return resp.get("message", "subprocess error"), True
+            if byte == b"":
+                with _repl_sessions_lock:
+                    _repl_sessions.pop(session_id, None)
+                return (
+                    "python error: subprocess died unexpectedly. "
+                    "It will be restarted on next call.",
+                    True,
+                )
 
-    return "python error: no response from subprocess.", True
+            partial += byte
+            if b"\n" in partial:
+                line_end = partial.index(b"\n")
+                line = partial[:line_end].decode("utf-8", errors="replace").strip()
+                partial = partial[line_end + 1:]
+                if not line:
+                    continue
+                try:
+                    resp = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                rtype = resp.get("type")
+                if rtype == "result":
+                    output = resp.get("stdout", "")
+                    err = resp.get("error")
+                    if err:
+                        if output:
+                            output = output + "\n"
+                        output = output + "Error: " + err
+                    return output, False
+                elif rtype == "error":
+                    return resp.get("message", "subprocess error"), True
+
+        return "python error: no response from subprocess.", True
 
 # -------------------------------------------------------------
 #  File read cache (TOCTOU enforcement)
@@ -399,7 +400,7 @@ def _resolve_path(file_path, cwd=None):
         return os.path.abspath(os.path.join(cwd, file_path))
     return file_path
 
-def execute_tool(name, args, sanitize_fn=None, cancel=None, cwd=None):
+def execute_tool(name, args, sanitize_fn=None, cancel=None, cwd=None, session_id=None):
     """
     Execute a tool by name.  args is a dict of parameters.
     Returns (output_string, is_error).
@@ -409,9 +410,9 @@ def execute_tool(name, args, sanitize_fn=None, cancel=None, cwd=None):
     if name == "patch":
         return _patch(args, sanitize_fn, cwd)
     if name == "python":
-        return _python(args, cancel)
+        return _python(args, cancel, session_id)
     if name == "reset":
-        return _python_reset(args)
+        return _python_reset(args, session_id)
     if name == "find":
         return _find(args, cwd)
     if name == "grep":
@@ -675,17 +676,17 @@ def _patch(args, sanitize_fn=None, cwd=None):
 # -------------------------------------------------------------
 #  python / reset  -- delegates to persistent subprocess
 # -------------------------------------------------------------
-def _python(args, cancel=None):
+def _python(args, cancel=None, session_id=None):
     code = args.get("code", "")
     if not code or not code.strip():
         return "python error: code parameter required and must be non-empty", True
 
-    result, is_error = _send_to_repl({"type": "exec", "code": code})
+    result, is_error = _send_to_repl(session_id or "default", {"type": "exec", "code": code}, cancel=cancel)
     return result, is_error
 
 
-def _python_reset(args):
-    result, is_error = _send_to_repl({"type": "clear"})
+def _python_reset(args, session_id=None):
+    result, is_error = _send_to_repl(session_id or "default", {"type": "clear"})
     return result, is_error
 
 # -------------------------------------------------------------

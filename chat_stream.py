@@ -440,7 +440,8 @@ class AgentStreamingTask(threading.Thread):
                         name, args,
                         sanitize_fn=_sanitize_text if self.sanitize else None,
                         cancel=self._cancel_event,
-                        cwd=cwd)
+                        cwd=cwd,
+                        session_id=str(self.view.id()))
 
                     args_str = json.dumps(args) if isinstance(args, dict) else str(args)
                     self._write("\n# --- Tool ---\ntool_call_id: {}\nname: {}\nargs: {}\n".format(

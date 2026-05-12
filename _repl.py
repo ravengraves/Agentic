@@ -22,6 +22,7 @@ import json
 import math
 import os
 import re
+import select
 import signal
 import subprocess
 import sys
@@ -92,10 +93,18 @@ def _send_result(stdout_text, error_text=None):
 # ---------------------------------------------------------------------------
 def main():
     """Read NDJSON commands from stdin, process, write NDJSON responses."""
-    # stdin as text for NDJSON reading
-    stdin = sys.stdin
+    stdin_fd = sys.stdin.fileno()
+    IDLE_TIMEOUT = 600  # self-terminate after 10 min idle
 
-    for raw_line in stdin:
+    while True:
+        ready, _, _ = select.select([stdin_fd], [], [], IDLE_TIMEOUT)
+        if not ready:
+            break  # 600s idle — exit cleanly
+
+        raw_line = sys.stdin.readline()
+        if not raw_line:
+            break  # EOF
+
         raw_line = raw_line.strip()
         if not raw_line:
             continue

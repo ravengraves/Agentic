@@ -301,7 +301,7 @@ def _run_agent(messages, model, cancel_event, max_rounds=10):
                 args = json.loads(tc["function"]["arguments"]) if isinstance(tc["function"]["arguments"], str) else (tc["function"]["arguments"] or {})
             except Exception:
                 args = tc["function"]["arguments"]
-            output, _ = execute_tool(name, args, cancel=cancel_event)
+            output, _ = execute_tool(name, args, cancel=cancel_event, session_id="cli")
             args_str = json.dumps(args) if isinstance(args, dict) else str(args)
             print("\n# --- Tool ---\ntool_call_id: {}\nname: {}\nargs: {}\n{}".format(tc["id"], name, args_str, output))
             messages.append({"role": "tool", "tool_call_id": tc["id"], "arguments": args_str, "content": output})
@@ -397,6 +397,7 @@ def _handle_slash(cmd, messages, model, config, session_dir):
         print("  /system <text> Replace system prompt")
     elif op == "/new":
         messages[:] = [messages[0]]
+        execute_tool("reset", {}, session_id="cli")
         print("[New conversation]")
     elif op == "/compact":
         messages[:] = _compact_history(messages, model)
@@ -459,6 +460,7 @@ def _handle_slash(cmd, messages, model, config, session_dir):
         print("[System prompt updated]")
     elif op == "/clear":
         messages[:] = [messages[0]]  # keep system msg
+        execute_tool("reset", {}, session_id="cli")
         print("[Cleared]")
     elif op in ("/status", "/tokens"):
         est = sum(len(m.get("content", "")) for m in messages) // CHARS_PER_TOKEN
