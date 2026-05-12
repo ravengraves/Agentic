@@ -34,6 +34,7 @@
 #  The plugin uses only Python features available in older
 #  Sublime Text builds (no f-string syntax, only .format()).
 # -------------------------------------------------------------
+import sys
 import os
 import time
 import json
@@ -43,7 +44,7 @@ import threading
 import random
 import re
 
-from agentic_tools import TOOLS, execute_tool
+from .agentic_tools import TOOLS, execute_tool
 
 import sublime
 import sublime_plugin
