@@ -5,14 +5,18 @@
 #
 #  Minimal Python 3.8+ (no f-strings, no type hints).
 # -------------------------------------------------------------
+import io
 import os
 import re
+import sys
 import time
 import json
 import glob
+import atexit
 import difflib
-import pickle
+import signal
 import subprocess
+import threading
 import unicodedata
 
 # -------------------------------------------------------------
@@ -227,14 +231,161 @@ TOOLS = [
 ]
 
 # -------------------------------------------------------------
-#  Python REPL persistent state
+#  Persistent Python REPL subprocess (NDJSON protocol)
 # -------------------------------------------------------------
-_PYTHON_STATE_FILE = ".agentic_python_state.pkl"
+
+_REPL_EXE = sys.executable
+_repl_proc = None
+_repl_lock = threading.Lock()
+_REPL_TIMEOUT = 30
+
+
+def _cleanup_repl():
+    """Terminate the REPL subprocess on plugin unload or process exit."""
+    global _repl_proc
+    if _repl_proc is not None:
+        try:
+            _repl_proc.stdin.close()
+        except (OSError, AttributeError):
+            pass
+        try:
+            _repl_proc.terminate()
+            _repl_proc.wait(timeout=3)
+        except Exception:
+            try:
+                _repl_proc.kill()
+            except OSError:
+                pass
+        _repl_proc = None
+
+
+atexit.register(_cleanup_repl)
+
+
+def _get_repl_script_path():
+    """Return the absolute path to the REPL server script bundled alongside this module."""
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "_repl.py")
+
+
+def _start_repl():
+    """Launch the persistent REPL subprocess. Returns the Popen object."""
+    global _repl_proc
+    _repl_proc = subprocess.Popen(
+        [_REPL_EXE, _get_repl_script_path()],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        bufsize=0,
+        cwd=os.getcwd(),
+    )
+    # Drain any startup noise on stderr (protocol uses JSON on stdout only)
+    return _repl_proc
+
+
+def _ensure_repl():
+    """Make sure the REPL subprocess is alive; restart if necessary."""
+    with _repl_lock:
+        if _repl_proc is None:
+            return _start_repl()
+        rv = _repl_proc.poll()
+        if rv is not None:
+            return _start_repl()
+        return _repl_proc
+
+
+def _send_to_repl(cmd_dict):
+    """
+    Send a NDJSON command to the REPL subprocess and read the next NDJSON response.
+    Returns (stdout_text, error_flag).
+    """
+    global _repl_proc
+
+    proc = _ensure_repl()
+
+    payload = json.dumps(cmd_dict) + "\n"
+    try:
+        proc.stdin.write(payload.encode("utf-8"))
+        proc.stdin.flush()
+    except (BrokenPipeError, OSError):
+        # Pipe broken -> restart inside lock
+        with _repl_lock:
+            _repl_proc = None
+        proc = _ensure_repl()
+        proc.stdin.write(payload.encode("utf-8"))
+        proc.stdin.flush()
+
+    # Read response line by line until we get a valid JSON protocol message
+    start_time = time.time()
+    partial = b""
+    while True:
+        if time.time() - start_time > _REPL_TIMEOUT:
+            try:
+                proc.terminate()
+                proc.wait(timeout=2)
+            except Exception:
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+            return (
+                "python error: execution timed out after 30s. "
+                "Simplify the code or split into smaller chunks.",
+                True,
+            )
+
+        try:
+            byte = proc.stdout.read(1)
+        except (IOError, OSError):
+            break
+
+        if byte == b"":
+            # EOF -- process died
+            with _repl_lock:
+                _repl_proc = None
+            return (
+                "python error: subprocess died unexpectedly. "
+                "It will be restarted on next call.",
+                True,
+            )
+
+        partial += byte
+
+        if b"\n" in partial:
+            line_end = partial.index(b"\n")
+            line = partial[:line_end].decode("utf-8", errors="replace").strip()
+            partial = partial[line_end + 1:]
+
+            if not line:
+                continue
+
+            try:
+                resp = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue  # not a protocol line; ignore
+
+            rtype = resp.get("type")
+            if rtype == "result":
+                output = resp.get("stdout", "")
+                err = resp.get("error")
+                if err:
+                    if output:
+                        output = output + "\n"
+                    output = output + "Error: " + err
+                return output, False
+            elif rtype == "error":
+                return resp.get("message", "subprocess error"), True
+
+    return "python error: no response from subprocess.", True
 
 # -------------------------------------------------------------
 #  File read cache (TOCTOU enforcement)
 # -------------------------------------------------------------
 _read_cache = {}  # file_path -> (mtime, size, full_read: bool)
+
+# Write cache: tracks the last mtime/size when patch wrote a file.
+# Used to suppress stale-mtime errors when the model itself last
+# modified the file (e.g. sequential patches without re-read).
+_write_cache = {}  # file_path -> (mtime, size)
 
 # Directories excluded from find/ls/read listings
 _TOOL_IGNORE = {".Agentic", ".git", "__pycache__", "node_modules"}
@@ -289,19 +440,30 @@ def _check_prior_read(file_path, require_full=True):
             "Safety: {} was never read. "
             "Use the read tool first to examine the file before editing.".format(file_path)
         )
-    cached = _read_cache[apath]
+    read_cached = _read_cache[apath]
     try:
         stat = os.stat(apath)
     except OSError:
         return False, (
             "Safety: {} no longer exists. Re-read the file to verify its current state.".format(file_path)
         )
-    if stat.st_mtime != cached[0] or stat.st_size != cached[1]:
-        return False, (
-            "Safety: {} has changed since last read (mtime or size mismatch). "
-            "Re-read the file before editing.".format(file_path)
-        )
-    if require_full and not cached[2]:
+
+    write_cached = _write_cache.get(apath)
+
+    if stat.st_mtime != read_cached[0] or stat.st_size != read_cached[1]:
+        # File has changed since last read.  If the model was the last
+        # writer and the file state matches that write, the model is the
+        # current author, so allow the edit (it may be a follow-up patch).
+        if write_cached and \
+           stat.st_mtime == write_cached[0] and stat.st_size == write_cached[1]:
+            pass  # model was last writer, file unchanged since then
+        else:
+            return False, (
+                "Safety: {} has changed since last read (mtime or size mismatch). "
+                "Re-read the file before editing.".format(file_path)
+            )
+
+    if require_full and not read_cached[2]:
         return False, (
             "Safety: {} was only partially read. "
             "Use read without offset/limit to read the full file before editing.".format(file_path)
@@ -486,6 +648,14 @@ def _patch(args, sanitize_fn=None, cwd=None):
     try:
         with open(file_path, "w", encoding="utf-8", newline="") as f:
             f.write(new_content)
+        # Update write cache for TOCTOU: track that the model wrote this file,
+        # so subsequent patches from the model don't trigger stale-mtime errors.
+        try:
+            apath = os.path.abspath(file_path)
+            wstat = os.stat(apath)
+            _write_cache[apath] = (wstat.st_mtime, wstat.st_size)
+        except OSError:
+            pass
     except Exception as e:
         return "patch error: writing file failed {}: {}".format(file_path, str(e)), True
 
@@ -503,83 +673,20 @@ def _patch(args, sanitize_fn=None, cwd=None):
     return "Patch applied{}.\n\n{}".format(extra, diff), False
 
 # -------------------------------------------------------------
-#  python  -- persistent REPL via exec + pickle state
+#  python / reset  -- delegates to persistent subprocess
 # -------------------------------------------------------------
-def _python_wrapper_script(state_path):
-    """Return the wrapper script that loads state, execs stdin code, saves state."""
-    lines = [
-        "import pickle, sys, json, os, math, subprocess, re",
-        "try:",
-        "    ns = pickle.load(open(r'" + state_path + "', 'rb'))",
-        "except:",
-        "    ns = {}",
-        "# Always inject fresh module references (modules cannot be pickled)",
-        "ns['json'] = json",
-        "ns['os'] = os",
-        "ns['math'] = math",
-        "ns['subprocess'] = subprocess",
-        "ns['re'] = re",
-        "code = sys.stdin.read()",
-        "try:",
-        "    exec(code, ns)",
-        "except Exception as e:",
-        "    sys.stderr.write('Error: ' + str(e))",
-        "# Remove modules before pickling (modules are not picklable)",
-        "for mod in ('json', 'os', 'math', 'subprocess', 're'):",
-        "    ns.pop(mod, None)",
-        "pickle.dump(ns, open(r'" + state_path + "', 'wb'))",
-    ]
-    return "\n".join(lines)
-
 def _python(args, cancel=None):
     code = args.get("code", "")
     if not code or not code.strip():
         return "python error: code parameter required and must be non-empty", True
 
-    state_path = os.path.join(os.getcwd(), _PYTHON_STATE_FILE)
-    wrapper = _python_wrapper_script(state_path)
+    result, is_error = _send_to_repl({"type": "exec", "code": code})
+    return result, is_error
 
-    try:
-        proc = subprocess.Popen(
-            ["python3", "-c", wrapper],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            cwd=os.getcwd(),
-        )
-        proc.stdin.write(code.encode("utf-8"))
-        proc.stdin.close()
-
-        start = time.time()
-        while proc.poll() is None:
-            if cancel and cancel.is_set():
-                proc.terminate()
-                try:
-                    proc.wait(1)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                return "python error: cancelled by user", True
-            if time.time() - start > 30:
-                proc.kill()
-                return "python error: execution timed out after 30s. Simplify the code or split into smaller chunks.", True
-            time.sleep(0.1)
-
-        out = proc.stdout.read().decode("utf-8", errors="replace").rstrip()
-        err = proc.stderr.read().decode("utf-8", errors="replace").rstrip()
-        if err:
-            out = out + ("\n" if out else "") + err
-        return out, False
-    except Exception as e:
-        return "python error: starting subprocess failed: {}. Check that python3 is installed.".format(str(e)), True
 
 def _python_reset(args):
-    state_path = os.path.join(os.getcwd(), _PYTHON_STATE_FILE)
-    try:
-        if os.path.isfile(state_path):
-            os.remove(state_path)
-        return "Python repl state cleared", False
-    except Exception as e:
-        return "reset error: clearing state failed: {}".format(str(e)), True
+    result, is_error = _send_to_repl({"type": "clear"})
+    return result, is_error
 
 # -------------------------------------------------------------
 #  find  -- glob search sorted by mtime
