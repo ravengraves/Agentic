@@ -311,7 +311,7 @@ Currently, this plugin supports chat incorporating user-highlighted code for con
 - [x] Multiple local LLM support
 - [x] Accelerator APIs ([groq](https://groq.com/), [Google TPU](https://cloud.google.com/blog/products/compute/inside-the-ironwood-tpu-codesigned-ai-stack))
 - [x] Sanitize LLM output - replace unnecessary unicode
-- [ ] Function calling
+- [x] Function calling (read, patch, python, reset, find, grep, ls)
 - [ ] Multi-agent workflows (e.g. generate then reduce/combine best solutions)
 - [ ] CAG context packing given prompt and project files
 
