@@ -154,6 +154,8 @@ def chat_stream(messages, model, cancel=None, tools=None):
                 continue
             payload = line[6:]
             if payload == "[DONE]":
+                if tool_accums:
+                    yield ("__tool_calls__", list(tool_accums.values()))
                 return
             try:
                 evt = json.loads(payload)
@@ -175,6 +177,11 @@ def chat_stream(messages, model, cancel=None, tools=None):
                             if "arguments" in tc["function"]:
                                 acc["function"]["arguments"] += tc["function"]["arguments"]
                     continue
+
+                if choice.get("finish_reason") == "tool_calls" and tool_accums:
+                    yield ("__tool_calls__", list(tool_accums.values()))
+                    return
+
                 if delta.get("reasoning_content"):
                     yield (True, delta["reasoning_content"])
                 elif delta.get("reasoning"):
@@ -270,6 +277,7 @@ def _run_agent(messages, model, cancel_event, max_rounds=10):
     for _round in range(max_rounds):
         tool_calls = None
         streamed_content = ""
+        streamed_reasoning = ""
         print("\n# --- Agent ---")
         for chunk in chat_stream(messages, model, cancel_event, tools=tools):
             if isinstance(chunk, tuple) and chunk[0] == "__tool_calls__":
@@ -277,7 +285,9 @@ def _run_agent(messages, model, cancel_event, max_rounds=10):
                 break
             if len(chunk) == 2:
                 is_reasoning, text = chunk
-                if not is_reasoning:
+                if is_reasoning:
+                    streamed_reasoning += text
+                else:
                     streamed_content += text
                     sys.stdout.write(text)
                     sys.stdout.flush()
@@ -289,10 +299,13 @@ def _run_agent(messages, model, cancel_event, max_rounds=10):
         if cancel_event.is_set() or not tool_calls:
             break
 
-        messages.append({
-            "role": "assistant", "content": streamed_content.strip() or "",
-            "tool_calls": [{"id": tc["id"], "type": "function", "function": {"name": tc["function"]["name"], "arguments": tc["function"]["arguments"]}} for tc in tool_calls],
-        })
+        msg = {"role": "assistant", "tool_calls": [{"id": tc["id"], "type": "function", "function": {"name": tc["function"]["name"], "arguments": tc["function"]["arguments"]}} for tc in tool_calls]}
+        content = streamed_content.strip()
+        if content:
+            msg["content"] = content
+        if streamed_reasoning.strip():
+            msg["reasoning_content"] = streamed_reasoning.strip()
+        messages.append(msg)
         for tc in tool_calls:
             if cancel_event.is_set():
                 break

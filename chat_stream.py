@@ -235,6 +235,8 @@ def chat_stream(messages, model, cancel=None, tools=None):
                 continue
             payload = line[6:]
             if payload == "[DONE]":
+                if tool_accums:
+                    yield ("__tool_calls__", list(tool_accums.values()))
                 return
 
             try:
@@ -263,6 +265,10 @@ def chat_stream(messages, model, cancel=None, tools=None):
                             if "arguments" in tc["function"]:
                                 acc["function"]["arguments"] += tc["function"]["arguments"]
                     continue
+
+                if choice.get("finish_reason") == "tool_calls" and tool_accums:
+                    yield ("__tool_calls__", list(tool_accums.values()))
+                    return
 
                 # Harvest content / reasoning tokens
                 if "reasoning_content" in delta and delta["reasoning_content"]:
@@ -372,6 +378,7 @@ class AgentStreamingTask(threading.Thread):
                 tool_calls = None
                 prev_reasoning = False
                 streamed_content = ""
+                streamed_reasoning = ""
                 self._write("\n\n# --- Agent ---\n")
                 for chunk in chat_stream(self.messages, model, self._cancel_event, tools=tooling):
                     if isinstance(chunk, tuple) and chunk[0] == "__tool_calls__":
@@ -391,6 +398,7 @@ class AgentStreamingTask(threading.Thread):
                         break
 
                     if is_reasoning:
+                        streamed_reasoning += text
                         if not self.show_reasoning:
                             continue
                         if not prev_reasoning:
@@ -408,9 +416,8 @@ class AgentStreamingTask(threading.Thread):
                     break
 
                 # Insert assistant message with tool_calls (required by OpenAI API protocol)
-                self.messages.append({
+                msg = {
                     "role": "assistant",
-                    "content": streamed_content.strip() or "",
                     "tool_calls": [
                         {
                             "id": tc["id"],
@@ -422,7 +429,13 @@ class AgentStreamingTask(threading.Thread):
                         }
                         for tc in tool_calls
                     ],
-                })
+                }
+                content = streamed_content.strip()
+                if content:
+                    msg["content"] = content
+                if streamed_reasoning.strip():
+                    msg["reasoning_content"] = streamed_reasoning.strip()
+                self.messages.append(msg)
 
                 # Execute accumulated tool calls
                 for tc in tool_calls:
