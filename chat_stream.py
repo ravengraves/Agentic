@@ -183,7 +183,22 @@ def chat_stream(messages, model, cancel=None, tools=None):
         elif "reasoning" in m and m["reasoning"]:  # groq
             yield (True, m["reasoning"])
         if "content" in m:
-            yield (False, m["content"])
+            content = m["content"]
+            start = content.find("<|tool_call>")
+            if start != -1:
+                end = content.find("<tool_call|>", start)
+                if end != -1:
+                    prefix = content[:start]
+                    if prefix.strip():
+                        yield (False, prefix)
+                    inner = content[start + len("<|tool_call>"):end]
+                    mm = re.search(r'call:\s*(?:\S+:)?([^{]+)\s*(\{[^}]*\})?', inner)
+                    if mm:
+                        name = mm.group(1).strip()
+                        args = mm.group(2) if mm.group(2) else "{}"
+                        yield ("__tool_calls__", [{"id": "tc_0", "function": {"name": name, "arguments": args}}])
+                        return
+            yield (False, content)
 
         # Tool calls in non-streaming response
         if m.get("tool_calls"):
@@ -206,6 +221,7 @@ def chat_stream(messages, model, cancel=None, tools=None):
 
     with urllib.request.urlopen(req) as resp:
         tool_accums = {}  # index -> {id, function: {name, arguments}}
+        _content_buf = ""
         for raw in resp:
             if cancel and cancel.is_set():
                 return
@@ -249,7 +265,25 @@ def chat_stream(messages, model, cancel=None, tools=None):
                 elif "reasoning" in delta and delta["reasoning"]:  # groq
                     yield (True, delta["reasoning"])
                 elif "content" in delta and delta["content"]:
-                    yield (False, delta["content"])
+                    _content_buf += delta["content"]
+                    start = _content_buf.find("<|tool_call>")
+                    if start == -1:
+                        yield (False, _content_buf)
+                        _content_buf = ""
+                        continue
+                    end = _content_buf.find("<tool_call|>", start)
+                    if end == -1:
+                        continue
+                    prefix = _content_buf[:start]
+                    if prefix.strip():
+                        yield (False, prefix)
+                    inner = _content_buf[start + len("<|tool_call>"):end]
+                    m = re.search(r'call:\s*(?:\S+:)?([^{]+)\s*(\{[^}]*\})?', inner)
+                    if m:
+                        name = m.group(1).strip()
+                        args = m.group(2) if m.group(2) else "{}"
+                        yield ("__tool_calls__", [{"id": "tc_0", "function": {"name": name, "arguments": args}}])
+                    _content_buf = _content_buf[end + len("<tool_call|>"):]
                 elif not delta:  # Final timing report or tool_calls finish
                     if choice.get("finish_reason") == "tool_calls" and tool_accums:
                         yield ("__tool_calls__", list(tool_accums.values()))
@@ -322,7 +356,7 @@ class AgentStreamingTask(threading.Thread):
         model_name = self.view.settings().get("agent_model")
         model = models[model_name]
 
-        input_tokens = int(sum([len(m.get("content", 0)) for m in self.messages]) / CHARS_PER_TOKEN)
+        input_tokens = int(sum([len(m.get("content") or "") for m in self.messages]) / CHARS_PER_TOKEN)
         fraction_used = input_tokens / model.get("context", float("NaN"))
         _printstatus("Streaming {}. Context: {} ({:.0f}%).".format(
             model_name, input_tokens, fraction_used * 100))
@@ -373,7 +407,7 @@ class AgentStreamingTask(threading.Thread):
                 # Insert assistant message with tool_calls (required by OpenAI API protocol)
                 self.messages.append({
                     "role": "assistant",
-                    "content": streamed_content.strip() or None,
+                    "content": streamed_content.strip() or "",
                     "tool_calls": [
                         {
                             "id": tc["id"],
@@ -446,7 +480,7 @@ class AgentStreamingTask(threading.Thread):
 
         # Auto-compact if context exceeds 70% of model limit
         if self.messages and model.get("auto_compact"):
-            est_tokens = sum(len(m.get("content", "")) for m in self.messages) // 4
+            est_tokens = sum(len(m.get("content") or "") for m in self.messages) // 4
             context_limit = model.get("context", 128000)
             if est_tokens > context_limit * 0.7:
                 _printstatus("Compacting context ({:.0f}% used)...".format(

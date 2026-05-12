@@ -1,0 +1,559 @@
+#!/usr/bin/env python3
+"""
+Agentic CLI - minimal standalone terminal agent.
+Reuses agentic_tools.py for tool execution and Agentic.sublime-settings for config.
+Python 3.8+, no f-strings, no type hints.
+"""
+import sys, os, time, json, re, threading, signal, urllib.request, urllib.error
+
+try:
+    import queue
+except ImportError:
+    import Queue as queue
+
+from agentic_tools import TOOLS, execute_tool
+
+CHARS_PER_TOKEN = 4
+
+# -------------------------------------------------------------
+#  Config loading
+# -------------------------------------------------------------
+def _parse_sublime_settings(path):
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path) as f:
+            raw = f.read()
+        raw = re.sub(r'\s+//[^\n]*', '', raw)
+        raw = re.sub(r',\s*([}\]])', r'\1', raw)
+        cfg = json.loads(raw)
+        if cfg.get("models"):
+            return cfg
+    except Exception:
+        pass
+    return None
+
+def _load_config():
+    # Try Sublime Text user packages directory (platform-specific) first
+    home = os.path.expanduser("~")
+    sublime_paths = [
+        os.path.join(home, ".config", "sublime-text", "Packages", "User", "Agentic.sublime-settings"),
+        os.path.join(home, "Library", "Application Support", "Sublime Text", "Packages", "User", "Agentic.sublime-settings"),
+        os.path.join(os.environ.get("APPDATA", ""), "Sublime Text", "Packages", "User", "Agentic.sublime-settings"),
+    ]
+    for sp in sublime_paths:
+        cfg = _parse_sublime_settings(sp)
+        if cfg:
+            return cfg
+    # Try local directory
+    local = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Agentic.sublime-settings")
+    cfg = _parse_sublime_settings(local)
+    if cfg:
+        return cfg
+    # Env fallback
+    return {
+        "default_prompt": os.environ.get("AGENTIC_PROMPT", "You are an expert coding agent. Take direct action using available tools."),
+        "models": {
+            "local": {
+                "url": os.environ.get("AGENTIC_URL", "http://127.0.0.1:8080/v1/chat/completions"),
+                "model": os.environ.get("AGENTIC_MODEL", "local-model"),
+                "token": os.environ.get("AGENTIC_TOKEN", "000000000000"),
+                "context": int(os.environ.get("AGENTIC_CONTEXT", "32768")),
+                "options": {"stream": True, "temperature": 0.7},
+                "tool_calling": True,
+                "auto_compact": False,
+            }
+        },
+    }
+
+# -------------------------------------------------------------
+#  LLM client (copied from chat_stream.py, no sublime deps)
+# -------------------------------------------------------------
+def _parse_metrics(r):
+    t = r.get("timings")
+    if t:
+        return (t["cache_n"], t["prompt_n"], t["prompt_per_second"], t["predicted_per_second"])
+    u = r.get("usage")
+    if u:
+        cache = u.get("prompt_tokens_details", {}).get("cached_tokens", 0)
+        prompt = u.get("prompt_tokens", 0) - cache
+        pt = u.get("prompt_time", 0) or 1e12
+        ct = u.get("completion_time", 0) or 1e12
+        return (cache, prompt, u.get("prompt_tokens", 0) / pt, u.get("completion_tokens", 0) / ct)
+    return None
+
+def chat_stream(messages, model, cancel=None, tools=None):
+    url = model.get("url")
+    token = model.get("token")
+    body = dict(model.get("options", {}))
+    body.update({"messages": messages, "model": model.get("model")})
+    if tools:
+        body["tools"] = tools
+
+    if model.get("no_system_prompt"):
+        for m in body.get("messages"):
+            if m["role"] == "developer":
+                m["role"] = "user"
+
+    stream = body.get("stream", False)
+    req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"), headers={
+        "Content-Type": "application/json",
+        "Authorization": "Bearer {}".format(token),
+        "User-Agent": "AgenticCLI/1.0",
+    })
+
+    if not stream:
+        try:
+            resp = urllib.request.urlopen(req)
+        except urllib.error.HTTPError as e:
+            print("HTTP {}: {}".format(e.code, e.reason))
+            raise
+        resp = json.loads("".join(r.decode("utf-8") for r in resp))
+        m = resp["choices"][0]["message"]
+        if m.get("reasoning_content"):
+            yield (True, m["reasoning_content"])
+        elif m.get("reasoning"):
+            yield (True, m["reasoning"])
+        if m.get("content"):
+            content = m["content"]
+            start = content.find("<|tool_call>")
+            if start != -1:
+                end = content.find("<tool_call|>", start)
+                if end != -1:
+                    prefix = content[:start]
+                    if prefix.strip():
+                        yield (False, prefix)
+                    inner = content[start + len("<|tool_call>"):end]
+                    mm = re.search(r'call:\s*(?:\S+:)?([^{]+)\s*(\{[^}]*\})?', inner)
+                    if mm:
+                        name = mm.group(1).strip()
+                        args = mm.group(2) if mm.group(2) else "{}"
+                        yield ("__tool_calls__", [{"id": "tc_0", "function": {"name": name, "arguments": args}}])
+                        return
+            yield (False, content)
+        if m.get("tool_calls"):
+            yield ("__tool_calls__", [{"id": tc["id"], "function": {"name": tc["function"]["name"], "arguments": tc["function"]["arguments"]}} for tc in m["tool_calls"]])
+            return
+        t = _parse_metrics(resp)
+        if t:
+            yield t
+        return
+
+    tool_accums = {}
+    _content_buf = ""
+    with urllib.request.urlopen(req) as resp:
+        for raw in resp:
+            if cancel and cancel.is_set():
+                return
+            line = raw.decode("utf-8").strip()
+            if not line.startswith("data: "):
+                continue
+            payload = line[6:]
+            if payload == "[DONE]":
+                return
+            try:
+                evt = json.loads(payload)
+            except ValueError:
+                continue
+            for choice in evt.get("choices", []):
+                delta = choice.get("delta", {})
+                if "tool_calls" in delta:
+                    for tc in delta["tool_calls"]:
+                        idx = tc["index"]
+                        if idx not in tool_accums:
+                            tool_accums[idx] = {"id": "", "function": {"name": "", "arguments": ""}}
+                        acc = tool_accums[idx]
+                        if "id" in tc:
+                            acc["id"] = tc["id"]
+                        if "function" in tc:
+                            if "name" in tc["function"]:
+                                acc["function"]["name"] = tc["function"]["name"]
+                            if "arguments" in tc["function"]:
+                                acc["function"]["arguments"] += tc["function"]["arguments"]
+                    continue
+                if delta.get("reasoning_content"):
+                    yield (True, delta["reasoning_content"])
+                elif delta.get("reasoning"):
+                    yield (True, delta["reasoning"])
+                elif delta.get("content"):
+                    _content_buf += delta["content"]
+                    start = _content_buf.find("<|tool_call>")
+                    if start == -1:
+                        yield (False, _content_buf)
+                        _content_buf = ""
+                        continue
+                    end = _content_buf.find("<tool_call|>", start)
+                    if end == -1:
+                        continue
+                    prefix = _content_buf[:start]
+                    if prefix.strip():
+                        yield (False, prefix)
+                    inner = _content_buf[start + len("<|tool_call>"):end]
+                    m = re.search(r'call:\s*(?:\S+:)?([^{]+)\s*(\{[^}]*\})?', inner)
+                    if m:
+                        name = m.group(1).strip()
+                        args = m.group(2) if m.group(2) else "{}"
+                        yield ("__tool_calls__", [{"id": "tc_0", "function": {"name": name, "arguments": args}}])
+                    _content_buf = _content_buf[end + len("<tool_call|>"):]
+                elif not delta:
+                    if choice.get("finish_reason") == "tool_calls" and tool_accums:
+                        yield ("__tool_calls__", list(tool_accums.values()))
+                        return
+                    t = _parse_metrics(evt)
+                    if t:
+                        yield t
+
+# -------------------------------------------------------------
+#  Compaction (LLM-based, Qwen-style)
+# -------------------------------------------------------------
+COMPACT_SYSTEM = "\n".join([
+    "You are a context summarization assistant. Summarize the conversation",
+    "into a structured snapshot another LLM will use to continue work.",
+    "Do NOT continue the conversation. ONLY output the structured summary.",
+    "",
+    "First reason in <scratchpad>. Then produce:",
+    "<state_snapshot>",
+    "  <overall_goal>A single sentence for the objective.</overall_goal>",
+    "  <key_knowledge>Bullet list of crucial facts, constraints, build commands.</key_knowledge>",
+    "  <file_system_state>Files read, created, modified with paths.</file_system_state>",
+    "  <recent_actions>Last few significant actions and outcomes.</recent_actions>",
+    "  <current_plan>Step-by-step plan. [DONE], [IN PROGRESS], [TODO].</current_plan>",
+    "</state_snapshot>",
+])
+
+def _compact_history(messages, model):
+    n = len(messages)
+    keep_start = int(n * 0.7)
+    if keep_start < 2 or keep_start >= n:
+        return messages
+    to_compact = list(messages[:keep_start])
+    to_keep = list(messages[keep_start:])
+    text_parts = []
+    for m in to_compact:
+        role = m.get("role", "?")
+        c = (m.get("content") or "").strip()
+        if role == "tool":
+            c = "{}: {}".format(m.get("name", "?"), c[:300])
+        text_parts.append("[{}] {}".format(role, c[:500]))
+    compact_req = [
+        {"role": "user", "content": "Summarize:\n\n" + "\n".join(text_parts)},
+    ]
+    summary_text = ""
+    try:
+        for chunk in chat_stream(compact_req, model, tools=None):
+            if isinstance(chunk, tuple) and len(chunk) == 2:
+                if not chunk[0]:
+                    summary_text += chunk[1]
+    except Exception:
+        pass
+    start = summary_text.find("<state_snapshot>")
+    end = summary_text.find("</state_snapshot>")
+    if start != -1 and end != -1:
+        summary_text = summary_text[start:end + len("</state_snapshot>")]
+    else:
+        summary_text = summary_text[:1000]
+    return [{"role": "user", "content": "[CONTEXT SUMMARY]\n" + summary_text.strip() + "\n[/CONTEXT SUMMARY]"}] + to_keep
+
+# -------------------------------------------------------------
+#  Agent loop
+# -------------------------------------------------------------
+def _run_agent(messages, model, cancel_event, max_rounds=10):
+    tools = TOOLS  # CLI always uses tools
+    for _round in range(max_rounds):
+        tool_calls = None
+        streamed_content = ""
+        print("\n# --- Agent ---")
+        for chunk in chat_stream(messages, model, cancel_event, tools=tools):
+            if isinstance(chunk, tuple) and chunk[0] == "__tool_calls__":
+                tool_calls = chunk[1]
+                break
+            if len(chunk) == 2:
+                is_reasoning, text = chunk
+                if not is_reasoning:
+                    streamed_content += text
+                    sys.stdout.write(text)
+                    sys.stdout.flush()
+            else:
+                break
+            if cancel_event.is_set():
+                break
+
+        if cancel_event.is_set() or not tool_calls:
+            break
+
+        messages.append({
+            "role": "assistant", "content": streamed_content.strip() or "",
+            "tool_calls": [{"id": tc["id"], "type": "function", "function": {"name": tc["function"]["name"], "arguments": tc["function"]["arguments"]}} for tc in tool_calls],
+        })
+        for tc in tool_calls:
+            if cancel_event.is_set():
+                break
+            name = tc["function"]["name"]
+            try:
+                args = json.loads(tc["function"]["arguments"]) if isinstance(tc["function"]["arguments"], str) else (tc["function"]["arguments"] or {})
+            except Exception:
+                args = tc["function"]["arguments"]
+            output, _ = execute_tool(name, args, cancel=cancel_event)
+            args_str = json.dumps(args) if isinstance(args, dict) else str(args)
+            print("\n# --- Tool ---\ntool_call_id: {}\nname: {}\nargs: {}\n{}".format(tc["id"], name, args_str, output))
+            messages.append({"role": "tool", "tool_call_id": tc["id"], "arguments": args_str, "content": output})
+
+    # Auto-compact
+    if model.get("auto_compact") and messages:
+        est = sum(len(m.get("content", "")) for m in messages) // CHARS_PER_TOKEN
+        if est > model.get("context", 32768) * 0.7:
+            sys.stderr.write("Compacting...\n")
+            sys.stderr.flush()
+            return _compact_history(messages, model)
+    return messages
+
+# -------------------------------------------------------------
+#  Input thread
+# -------------------------------------------------------------
+def _input_reader(in_queue, stopper):
+    while not stopper.is_set():
+        try:
+            line = sys.stdin.readline()
+            if not line:
+                stopper.set()
+                in_queue.put(None)
+                break
+            in_queue.put(line.rstrip("\n"))
+        except (EOFError, KeyboardInterrupt):
+            stopper.set()
+            in_queue.put(None)
+            break
+
+# -------------------------------------------------------------
+#  Slash commands
+# -------------------------------------------------------------
+def _load_session(path, messages):
+    loaded = []
+    with open(path) as f:
+        sections = re.split(r'\n(?=# --- )', f.read())
+    for sec in sections:
+        sec = sec.strip()
+        if not sec:
+            continue
+        hdr_match = re.match(r'# --- (\w+) ---', sec)
+        if not hdr_match:
+            continue
+        role = hdr_match.group(1).lower()
+        body = sec[sec.index("\n")+1:].strip()
+        if role == "tool":
+            parts = body.split("\n", 3)
+            tc_id = parts[0].replace("tool_call_id: ", "") if len(parts) > 0 else ""
+            tname = parts[1].replace("name: ", "") if len(parts) > 1 else ""
+            targs = parts[2].replace("args: ", "") if len(parts) > 2 else ""
+            content = parts[3] if len(parts) > 3 else ""
+            loaded.append({"role": "tool", "tool_call_id": tc_id, "name": tname,
+                           "arguments": targs, "content": content})
+        else:
+            loaded.append({"role": role, "content": body})
+    if loaded and loaded[0]["role"] == "system":
+        loaded[0]["role"] = "developer"
+    if loaded:
+        messages[:] = loaded
+
+def _print_messages(messages):
+    """Print conversation in markdown format."""
+    for m in messages:
+        role = m.get("role", "?")
+        c = m.get("content", "")
+        if role == "developer":
+            role = "system"
+        if role == "tool":
+            c = "tool_call_id: {}\nname: {}\nargs: {}\n{}".format(
+                m.get("tool_call_id", ""), m.get("name", "?"),
+                m.get("arguments", "{}"), c)
+        print("# --- {} ---\n{}".format(role.title(), c))
+    print()
+
+def _handle_slash(cmd, messages, model, config, session_dir):
+    parts = cmd.split(None, 1)
+    op = parts[0].lower()
+    arg = parts[1] if len(parts) > 1 else ""
+
+    if op in ("/quit", "/q"):
+        return True
+    elif op == "/help":
+        print("  /quit  /q      Exit")
+        print("  /help          This help")
+        print("  /new           New conversation (keep system prompt)")
+        print("  /clear         Clear messages (same as /new)")
+        print("  /compact       LLM-summarize older context")
+        print("  /status        Show session info (model, tokens, turns)")
+        print("  /save [name]   Save conversation to .Agentic/")
+        print("  /load [name]   Load conversation from .Agentic/")
+        print("  /model <name>  Switch model")
+        print("  /system <text> Replace system prompt")
+    elif op == "/new":
+        messages[:] = [messages[0]]
+        print("[New conversation]")
+    elif op == "/compact":
+        messages[:] = _compact_history(messages, model)
+        print("[Context compacted]")
+    elif op == "/model":
+        models = config.get("models", {})
+        if arg in models:
+            model.clear()
+            model.update(models[arg])
+            print("[Model: {}]".format(arg))
+        else:
+            print("[Available models: {}]".format(", ".join(models.keys())))
+    elif op == "/save":
+        ts = time.strftime("%Y-%m-%d_%H-%M")
+        name = ts + ("-" + arg if arg else "")
+        path = os.path.join(session_dir, name + ".md")
+        with open(path, "w") as f:
+            for m in messages:
+                role = m.get("role", "?")
+                c = m.get("content", "")
+                if role == "tool":
+                    c = "tool_call_id: {}\nname: {}\nargs: {}\n{}".format(
+                        m.get("tool_call_id", ""), m.get("name", "?"),
+                        m.get("arguments", "{}"), c)
+                f.write("# --- {} ---\n{}\n\n".format(role.title(), c))
+        print("[Saved to .Agentic/{}]".format(os.path.basename(path)))
+    elif op == "/load":
+        files = sorted([f for f in os.listdir(session_dir) if f.endswith(".md")],
+                       key=lambda x: os.path.getmtime(os.path.join(session_dir, x)), reverse=True)
+        if not arg:
+            if not files:
+                print("[No saved sessions in .Agentic/]")
+            else:
+                print("[Saved sessions (use /load <name> or /load <number>):]")
+                for i, f in enumerate(files):
+                    mtime = time.strftime("%m-%d %H:%M", time.localtime(os.path.getmtime(os.path.join(session_dir, f))))
+                    print("  {}: {}  ({})".format(i+1, f[:-3], mtime))
+        elif arg.isdigit():
+            idx = int(arg) - 1
+            if 0 <= idx < len(files):
+                _load_session(os.path.join(session_dir, files[idx]), messages)
+                _print_messages(messages)
+                print("[Loaded {}]".format(files[idx][:-3]))
+            else:
+                print("[Invalid session number. Use 1-{}]".format(len(files)))
+        else:
+            matches = [f for f in files if arg in f]
+            if not matches:
+                print("[No session matching '{}']".format(arg))
+            elif len(matches) == 1:
+                _load_session(os.path.join(session_dir, matches[0]), messages)
+                _print_messages(messages)
+                print("[Loaded {}]".format(matches[0][:-3]))
+            else:
+                print("[Multiple matches (use /load <number>):]")
+                for i, f in enumerate(matches):
+                    print("  {}: {}".format(i+1, f[:-3]))
+    elif op == "/system":
+        messages[0]["content"] = arg
+        print("[System prompt updated]")
+    elif op == "/clear":
+        messages[:] = [messages[0]]  # keep system msg
+        print("[Cleared]")
+    elif op in ("/status", "/tokens"):
+        est = sum(len(m.get("content", "")) for m in messages) // CHARS_PER_TOKEN
+        ctx = model.get("context", 32768)
+        pct = float(est) / ctx * 100
+        turns = sum(1 for m in messages if m.get("role") in ("user", "assistant"))
+        tools_called = sum(1 for m in messages if m.get("role") == "tool")
+        print("  Model:    {} ({} tools)".format(model.get("model", "?"), len(TOOLS)))
+        print("  Messages: {} ({}/{} turns, {} tools called)".format(len(messages), turns // 2, turns, tools_called))
+        print("  Context:  {} / {} tokens ({:.0f}%)".format(est, ctx, pct))
+        print("  Compact:  {}".format("on" if model.get("auto_compact") else "off"))
+    else:
+        print("[Unknown command: {}]".format(op))
+    return False
+
+# -------------------------------------------------------------
+#  Main
+# -------------------------------------------------------------
+def main():
+    config = _load_config()
+    models = config.get("models", {})
+    first_key = next(iter(models))
+    model = dict(models[first_key])
+    prompt = config.get("default_prompt", "You are an expert coding agent.")
+    enable_comp = config.get("auto_compact", False)
+    if enable_comp:
+        model["auto_compact"] = True
+
+    session_dir = os.path.join(os.getcwd(), ".Agentic")
+    os.makedirs(session_dir, exist_ok=True)
+
+    messages = [{"role": "developer", "content": prompt}]
+    cancel_event = threading.Event()
+    in_queue = queue.Queue()
+    stopper = threading.Event()
+
+    signal.signal(signal.SIGINT, lambda s, f: cancel_event.set())
+
+    reader = threading.Thread(target=_input_reader, args=(in_queue, stopper), daemon=True)
+    reader.start()
+
+    print("# --- System ---\n{}\n".format(prompt))
+    print("Model: {} | Context: {} | Tools: {} | /help for commands\n".format(
+        model.get("model"), model.get("context", "?"), len(TOOLS)))
+
+    # If launched with arguments, treat as initial command
+    if len(sys.argv) > 1:
+        init_cmd = " ".join(sys.argv[1:])
+        print("\n# --- User ---\n{}".format(init_cmd))
+        messages.append({"role": "user", "content": init_cmd})
+        cancel_event.clear()
+        print()
+        messages = _run_agent(messages, model, cancel_event)
+        print()
+        if cancel_event.is_set():
+            print("[Interrupted]")
+        cancel_event.clear()
+
+    try:
+        while not stopper.is_set():
+            sys.stdout.write("> ")
+            sys.stdout.flush()
+            user_input = in_queue.get()
+            if user_input is None:
+                break
+            if not user_input.strip():
+                continue
+            if user_input.startswith("/"):
+                if _handle_slash(user_input, messages, model, config, session_dir):
+                    break
+                continue
+
+            # Collect multi-line input: read until blank line
+            lines = [user_input]
+            while True:
+                sys.stdout.write("| ")
+                sys.stdout.flush()
+                line = in_queue.get()
+                if line is None:
+                    stopper.set()
+                    break
+                if line.strip() == "":
+                    break
+                lines.append(line)
+            if stopper.is_set():
+                break
+            user_input = "\n".join(lines)
+
+            print("\n# --- User ---\n{}".format(user_input))
+            messages.append({"role": "user", "content": user_input})
+
+            cancel_event.clear()
+            print()
+            messages = _run_agent(messages, model, cancel_event)
+            print()
+
+            if cancel_event.is_set():
+                print("[Interrupted]")
+    except KeyboardInterrupt:
+        cancel_event.set()
+    finally:
+        stopper.set()
+        print("Goodbye.")
+
+if __name__ == "__main__":
+    main()

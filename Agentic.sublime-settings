@@ -68,6 +68,7 @@
 		"oss-20b-high-1": {
 			"url": "http://127.0.0.1:8080/v1/chat/completions", // local
 			"model": "gpt-oss-20b", // model name (from API)
+			"tool_calling": false, // whether to allow tool calling
 			"token": "000000000000", // Token for OpenAI API
 			"options": { // (API parameters here)
 				"stream": true,

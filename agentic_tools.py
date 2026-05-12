@@ -236,6 +236,9 @@ _PYTHON_STATE_FILE = ".agentic_python_state.pkl"
 # -------------------------------------------------------------
 _read_cache = {}  # file_path -> (mtime, size, full_read: bool)
 
+# Directories excluded from find/ls/read listings
+_TOOL_IGNORE = {".Agentic", ".git", "__pycache__", "node_modules"}
+
 # -------------------------------------------------------------
 #  Tool dispatch
 # -------------------------------------------------------------
@@ -338,6 +341,10 @@ def _read(args, sanitize_fn=None, cwd=None):
             entries.sort()
             lines = []
             for e in entries:
+                if e.endswith("~") or e.startswith("#"):
+                    continue
+                if e in _TOOL_IGNORE:
+                    continue
                 full = os.path.join(file_path, e)
                 suffix = "/" if os.path.isdir(full) else ""
                 lines.append(e + suffix)
@@ -587,6 +594,9 @@ def _find(args, cwd=None):
     except Exception as e:
         return "find error: search failed '{}' in {}: {}".format(pattern, root, str(e)), True
 
+    # Filter out ignored directories
+    matches = [p for p in matches if not any(seg in _TOOL_IGNORE for seg in p.split(os.sep))]
+
     if not matches:
         return (
             "find: no files matching '{}' in {}. "
@@ -741,6 +751,10 @@ def _ls(args, cwd=None):
         entries.sort()
         lines = []
         for e in entries:
+            if e.endswith("~") or e.startswith("#"):
+                continue
+            if e in _TOOL_IGNORE:
+                continue
             full = os.path.join(path, e)
             try:
                 if os.path.isdir(full):
