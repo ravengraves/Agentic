@@ -231,6 +231,22 @@ TOOLS = [
     },
 ]
 
+_OUTPUT_CONTROL_PROPERTIES = {
+    "max_output_lines": {
+        "type": "number",
+        "description": (
+            "Optional output line cap. Defaults to a few hundred lines; "
+            "increase when you need more tool output."
+        ),
+    },
+}
+
+for _tool in TOOLS:
+    _params = _tool.get("function", {}).get("parameters", {})
+    if isinstance(_params, dict) and _params.get("type") == "object":
+        _params.setdefault("properties", {}).update(_OUTPUT_CONTROL_PROPERTIES)
+del _tool, _params
+
 # -------------------------------------------------------------
 #  Persistent Python REPL subprocess (NDJSON protocol)
 # -------------------------------------------------------------
@@ -391,6 +407,9 @@ _write_cache = {}  # file_path -> (mtime, size)
 # Directories excluded from find/ls/read listings
 _TOOL_IGNORE = {".Agentic", ".git", "__pycache__", "node_modules"}
 
+DEFAULT_TOOL_OUTPUT_MAX_LINES = 300
+HARD_TOOL_OUTPUT_MAX_LINES = 20000
+
 # -------------------------------------------------------------
 #  Tool dispatch
 # -------------------------------------------------------------
@@ -400,26 +419,72 @@ def _resolve_path(file_path, cwd=None):
         return os.path.abspath(os.path.join(cwd, file_path))
     return file_path
 
+def _as_positive_int(value, default, hard_max=None):
+    try:
+        value = int(value)
+    except Exception:
+        return default
+    if value < 0:
+        return default
+    if hard_max and value > hard_max:
+        return hard_max
+    return value
+
+def _clip_by_lines(text, max_lines):
+    lines = text.splitlines(True)
+    if max_lines <= 0 or len(lines) <= max_lines:
+        return text, False
+    head_count = max(1, int(max_lines * 0.67))
+    tail_count = max(1, max_lines - head_count)
+    omitted = len(lines) - head_count - tail_count
+    marker = (
+        "\n[... tool output truncated: {} lines omitted from middle. "
+        "Use max_output_lines to request more. ...]\n"
+    ).format(omitted)
+    return "".join(lines[:head_count]) + marker + "".join(lines[-tail_count:]), True
+
+def _clip_tool_output(output, args):
+    if output is None:
+        return "", False
+    if not isinstance(output, str):
+        output = str(output)
+
+    args = args if isinstance(args, dict) else {}
+    max_lines = _as_positive_int(
+        args.get("max_output_lines"),
+        DEFAULT_TOOL_OUTPUT_MAX_LINES,
+        HARD_TOOL_OUTPUT_MAX_LINES)
+
+    output, clipped_lines = _clip_by_lines(output, max_lines)
+    return output, clipped_lines
+
 def execute_tool(name, args, sanitize_fn=None, cancel=None, cwd=None, session_id=None):
     """
     Execute a tool by name.  args is a dict of parameters.
     Returns (output_string, is_error).
     """
+    args = args if isinstance(args, dict) else {}
     if name == "read":
-        return _read(args, sanitize_fn, cwd)
-    if name == "patch":
-        return _patch(args, sanitize_fn, cwd)
-    if name == "python":
-        return _python(args, cancel, session_id)
-    if name == "reset":
-        return _python_reset(args, session_id)
-    if name == "find":
-        return _find(args, cwd)
-    if name == "grep":
-        return _grep(args, cwd)
-    if name == "ls":
-        return _ls(args, cwd)
-    return "tool error: unknown tool '{}'. Available: read, patch, python, reset, find, grep, ls.".format(name), True
+        output, is_error = _read(args, sanitize_fn, cwd)
+    elif name == "patch":
+        output, is_error = _patch(args, sanitize_fn, cwd)
+    elif name == "python":
+        output, is_error = _python(args, cancel, session_id)
+    elif name == "reset":
+        output, is_error = _python_reset(args, session_id)
+    elif name == "find":
+        output, is_error = _find(args, cwd)
+    elif name == "grep":
+        output, is_error = _grep(args, cwd)
+    elif name == "ls":
+        output, is_error = _ls(args, cwd)
+    else:
+        return "tool error: unknown tool '{}'. Available: read, patch, python, reset, find, grep, ls.".format(name), True
+
+    output, clipped = _clip_tool_output(output, args)
+    if clipped and name == "read" and not is_error:
+        _mark_read(_resolve_path(args.get("file_path", ""), cwd), full_read=False)
+    return output, is_error
 
 # -------------------------------------------------------------
 #  TOCTOU helpers
@@ -484,8 +549,6 @@ _BINARY_EXTS = {
     ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
 }
 
-_MAX_READ_BYTES = 50 * 1024
-
 def _read(args, sanitize_fn=None, cwd=None):
     file_path = _resolve_path(args.get("file_path", ""), cwd)
     offset = int(args.get("offset", 1))
@@ -532,9 +595,7 @@ def _read(args, sanitize_fn=None, cwd=None):
     except Exception as e:
         return "read error: reading file failed {}: {}".format(file_path, str(e)), True
 
-    # Mark file as read (TOCTOU enforcement)
     full_read = (offset == 1 and limit >= len(all_lines))
-    _mark_read(file_path, full_read=full_read)
 
     # Slice
     start = max(0, offset - 1)
@@ -543,16 +604,17 @@ def _read(args, sanitize_fn=None, cwd=None):
 
     # Number and trim each line
     out = []
+    line_clipped = False
     for i, line in enumerate(chunk, start=start + 1):
         if len(line) > 2000:
+            line_clipped = True
             line = line[:2000] + "... [truncated]"
         out.append("{}: {}".format(i, line.rstrip("\n")))
 
     result = "\n".join(out)
     if sanitize_fn:
         result = sanitize_fn(result)
-    if len(result) > _MAX_READ_BYTES:
-        result = result[:_MAX_READ_BYTES] + "\n... [truncated]"
+    _mark_read(file_path, full_read=full_read and not line_clipped)
     return result, False
 
 # -------------------------------------------------------------

@@ -2,6 +2,7 @@
 	// Default values that the user can override
 	"default_prompt": "You are an expert coding agent with read, patch, grep, find, ls, and python tools. Take direct action -- read files before editing, verify changes, explore with find/grep/ls instead of guessing. Make minimal correct changes. Be concise. When errors occur, re-read the file and try again.",
 	"default_models": "models_high",
+	"default_models_compact": "models_low",
 
 	// These models are good for most programming tasks but can be slow:
 	"models_high": ["high_1"],
@@ -19,10 +20,25 @@
 	"sanitize_output": false,
 
 	// Load AGENTS.md from project folder and inject into system prompt
-	"enable_agents_md": false,
+	"enable_agents_md": true,
 
 	// Automatically compact context with LLM summarization when above 70% of model context limit
 	"auto_compact": false,
+
+	// Manual chat compaction behavior: "new_chat" opens a compacted continuation
+	// chat, "replace" overwrites the current chat buffer.
+	"compact_chat_behavior": "new_chat",
+
+	// Compaction preserves the first N protocol-safe message groups, summarizes the middle,
+	// and preserves the last N protocol-safe message groups.
+	"compact_keep_head": 4,
+	"compact_keep_tail": 6,
+
+	// Tool outputs larger than this are clipped during compaction by preserving
+	// the first/last N lines and replacing the middle with an omission marker.
+	"compact_tool_max_chars": 4000,
+	"compact_tool_head_lines": 80,
+	"compact_tool_tail_lines": 80,
 
 	// output streaming status and est. cost to console ([ctrl] + [`])
 	"console_log": false,

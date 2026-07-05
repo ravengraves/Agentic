@@ -50,11 +50,12 @@ def _sigterm_handler(signum, frame):
     sys.exit(0)
 
 
-signal.signal(signal.SIGTERM, _sigterm_handler)
-try:
-    signal.signal(signal.SIGHUP, _sigterm_handler)
-except AttributeError:
-    pass  # Windows has no SIGHUP
+def _install_signal_handlers():
+    signal.signal(signal.SIGTERM, _sigterm_handler)
+    try:
+        signal.signal(signal.SIGHUP, _sigterm_handler)
+    except AttributeError:
+        pass  # Windows has no SIGHUP
 
 # ---------------------------------------------------------------------------
 # State
@@ -93,6 +94,7 @@ def _send_result(stdout_text, error_text=None):
 # ---------------------------------------------------------------------------
 def main():
     """Read NDJSON commands from stdin, process, write NDJSON responses."""
+    _install_signal_handlers()
     stdin_fd = sys.stdin.fileno()
     IDLE_TIMEOUT = 600  # self-terminate after 10 min idle
 

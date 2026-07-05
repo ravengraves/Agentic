@@ -1,17 +1,23 @@
 #!/usr/bin/env python3
 """
 Agentic CLI - minimal standalone terminal agent.
-Reuses agentic_tools.py for tool execution and Agentic.sublime-settings for config.
+Reuses lib/ helpers for tool execution and Agentic.sublime-settings for config.
 Python 3.8+, no f-strings, no type hints.
 """
-import sys, os, time, json, re, threading, signal, urllib.request, urllib.error
+import sys, os, time, json, re, argparse, urllib.error
 
-try:
-    import queue
-except ImportError:
-    import Queue as queue
-
-from agentic_tools import TOOLS, execute_tool
+from lib.agentic_tools import TOOLS, execute_tool
+from lib.agentic_client import stream_chat
+from lib.agentic_compaction import compact_history, copy_compaction_settings
+from lib.agentic_markdown import (
+    MarkdownContentEscaper,
+    assistant_tool_message,
+    format_chat,
+    format_tool_block,
+    parse_chat,
+    tool_result_message,
+)
+from lib.agentic_project import apply_agents_md
 
 CHARS_PER_TOKEN = 4
 
@@ -27,11 +33,17 @@ def _parse_sublime_settings(path):
         raw = re.sub(r'\s+//[^\n]*', '', raw)
         raw = re.sub(r',\s*([}\]])', r'\1', raw)
         cfg = json.loads(raw)
-        if cfg.get("models"):
+        if isinstance(cfg, dict):
             return cfg
     except Exception:
         pass
     return None
+
+def _overlay_config(base, override):
+    """Mimic Sublime settings lookup: user keys replace default keys."""
+    cfg = dict(base or {})
+    cfg.update(override or {})
+    return cfg
 
 def _load_config():
     # Try Sublime Text user packages directory (platform-specific) first
@@ -41,18 +53,22 @@ def _load_config():
         os.path.join(home, "Library", "Application Support", "Sublime Text", "Packages", "User", "Agentic.sublime-settings"),
         os.path.join(os.environ.get("APPDATA", ""), "Sublime Text", "Packages", "User", "Agentic.sublime-settings"),
     ]
-    for sp in sublime_paths:
-        cfg = _parse_sublime_settings(sp)
-        if cfg:
-            return cfg
-    # Try local directory
     local = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Agentic.sublime-settings")
-    cfg = _parse_sublime_settings(local)
-    if cfg:
+    cfg = _parse_sublime_settings(local) or {}
+    for sp in sublime_paths:
+        user_cfg = _parse_sublime_settings(sp)
+        if user_cfg:
+            cfg = _overlay_config(cfg, user_cfg)
+            break
+    if cfg.get("models"):
         return cfg
+
     # Env fallback
     return {
         "default_prompt": os.environ.get("AGENTIC_PROMPT", "You are an expert coding agent. Take direct action using available tools."),
+        "enable_agents_md": True,
+        "default_models_compact": "models_low",
+        "models_low": ["local"],
         "models": {
             "local": {
                 "url": os.environ.get("AGENTIC_URL", "http://127.0.0.1:8080/v1/chat/completions"),
@@ -66,329 +82,234 @@ def _load_config():
         },
     }
 
-# -------------------------------------------------------------
-#  LLM client (copied from chat_stream.py, no sublime deps)
-# -------------------------------------------------------------
-def _parse_metrics(r):
-    t = r.get("timings")
-    if t:
-        return (t["cache_n"], t["prompt_n"], t["prompt_per_second"], t["predicted_per_second"])
-    u = r.get("usage")
-    if u:
-        cache = u.get("prompt_tokens_details", {}).get("cached_tokens", 0)
-        prompt = u.get("prompt_tokens", 0) - cache
-        pt = u.get("prompt_time", 0) or 1e12
-        ct = u.get("completion_time", 0) or 1e12
-        return (cache, prompt, u.get("prompt_tokens", 0) / pt, u.get("completion_tokens", 0) / ct)
-    return None
-
 def chat_stream(messages, model, cancel=None, tools=None):
-    url = model.get("url")
-    token = model.get("token")
-    body = dict(model.get("options", {}))
-    body.update({"messages": messages, "model": model.get("model")})
-    if tools:
-        body["tools"] = tools
+    return stream_chat(
+        messages,
+        model,
+        cancel=cancel,
+        tools=tools,
+        user_agent="AgenticCLI/1.0")
 
-    if model.get("no_system_prompt"):
-        for m in body.get("messages"):
-            if m["role"] == "developer":
-                m["role"] = "user"
+def _select_model(config, model_name=None):
+    models = config.get("models") or {}
+    if not models:
+        raise SystemExit("No models configured.")
+    if model_name:
+        if model_name not in models:
+            available = ", ".join(sorted(models.keys()))
+            raise SystemExit(
+                "Unknown model '{}'. Available: {}".format(model_name, available))
+        return model_name, dict(models[model_name])
+    first_key = next(iter(models))
+    return first_key, dict(models[first_key])
 
-    stream = body.get("stream", False)
-    req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"), headers={
-        "Content-Type": "application/json",
-        "Authorization": "Bearer {}".format(token),
-        "User-Agent": "AgenticCLI/1.0",
-    })
+def _select_compact_model(config, fallback):
+    models = config.get("models") or {}
+    names = config.get(config.get("default_models_compact", "models_low")) or []
+    for name in names:
+        if name in models:
+            compact = dict(models[name])
+            compact["_compact_model_name"] = name
+            return compact
+    compact = dict(fallback or {})
+    compact["_compact_model_name"] = "current"
+    return compact
 
-    if not stream:
-        try:
-            resp = urllib.request.urlopen(req)
-        except urllib.error.HTTPError as e:
-            print("HTTP {}: {}".format(e.code, e.reason))
-            raise
-        resp = json.loads("".join(r.decode("utf-8") for r in resp))
-        m = resp["choices"][0]["message"]
-        if m.get("reasoning_content"):
-            yield (True, m["reasoning_content"])
-        elif m.get("reasoning"):
-            yield (True, m["reasoning"])
-        if m.get("content"):
-            content = m["content"]
-            start = content.find("<|tool_call>")
-            if start != -1:
-                end = content.find("<tool_call|>", start)
-                if end != -1:
-                    prefix = content[:start]
-                    if prefix.strip():
-                        yield (False, prefix)
-                    inner = content[start + len("<|tool_call>"):end]
-                    mm = re.search(r'call:\s*(?:\S+:)?([^{]+)\s*(\{[^}]*\})?', inner)
-                    if mm:
-                        name = mm.group(1).strip()
-                        args = mm.group(2) if mm.group(2) else "{}"
-                        try:
-                            json.loads(args)
-                            yield ("__tool_calls__", [{"id": "tc_0", "function": {"name": name, "arguments": args}}])
-                            return
-                        except (ValueError, Exception):
-                            pass
-            yield (False, content)
-        if m.get("tool_calls"):
-            yield ("__tool_calls__", [{"id": tc["id"], "function": {"name": tc["function"]["name"], "arguments": tc["function"]["arguments"]}} for tc in m["tool_calls"]])
-            return
-        t = _parse_metrics(resp)
-        if t:
-            yield t
-        return
+def _apply_config_to_model(model, config):
+    if "auto_compact" in config:
+        model["auto_compact"] = config["auto_compact"]
+    model = copy_compaction_settings(model, config)
+    model["_compact_model"] = copy_compaction_settings(
+        _select_compact_model(config, model), config)
+    return model
 
-    tool_accums = {}
-    _content_buf = ""
-    with urllib.request.urlopen(req) as resp:
-        for raw in resp:
-            if cancel and cancel.is_set():
-                return
-            line = raw.decode("utf-8").strip()
-            if not line.startswith("data: "):
-                continue
-            payload = line[6:]
-            if payload == "[DONE]":
-                if tool_accums:
-                    yield ("__tool_calls__", list(tool_accums.values()))
-                return
-            try:
-                evt = json.loads(payload)
-            except ValueError:
-                continue
-            for choice in evt.get("choices", []):
-                delta = choice.get("delta", {})
-                if "tool_calls" in delta:
-                    for tc in delta["tool_calls"]:
-                        idx = tc["index"]
-                        if idx not in tool_accums:
-                            tool_accums[idx] = {"id": "", "function": {"name": "", "arguments": ""}}
-                        acc = tool_accums[idx]
-                        if "id" in tc:
-                            acc["id"] = tc["id"]
-                        if "function" in tc:
-                            if "name" in tc["function"]:
-                                acc["function"]["name"] = tc["function"]["name"]
-                            if "arguments" in tc["function"]:
-                                acc["function"]["arguments"] += tc["function"]["arguments"]
-                    continue
+def _apply_agents_md(messages, config, cwd):
+    return apply_agents_md(
+        messages,
+        cwd,
+        enabled=config.get("enable_agents_md", True))
 
-                if choice.get("finish_reason") == "tool_calls" and tool_accums:
-                    yield ("__tool_calls__", list(tool_accums.values()))
-                    return
+def _parse_args(argv):
+    parser = argparse.ArgumentParser(
+        description="Agentic CLI - run an OpenAI-compatible local or remote model.")
+    parser.add_argument(
+        "--model",
+        dest="model_name",
+        help="Model settings key to use, e.g. openai-nano.")
+    parser.add_argument(
+        "--query",
+        dest="query",
+        help="Run one noninteractive query and exit.")
+    parser.add_argument(
+        "prompt",
+        nargs="*",
+        help="Prompt text. If present, runs once and exits.")
+    return parser.parse_args(argv)
 
-                if delta.get("reasoning_content"):
-                    yield (True, delta["reasoning_content"])
-                elif delta.get("reasoning"):
-                    yield (True, delta["reasoning"])
-                elif delta.get("content"):
-                    _content_buf += delta["content"]
-                    start = _content_buf.find("<|tool_call>")
-                    if start == -1:
-                        yield (False, _content_buf)
-                        _content_buf = ""
-                        continue
-                    end = _content_buf.find("<tool_call|>", start)
-                    if end == -1:
-                        continue
-                    prefix = _content_buf[:start]
-                    if prefix.strip():
-                        yield (False, prefix)
-                    inner = _content_buf[start + len("<|tool_call>"):end]
-                    m = re.search(r'call:\s*(?:\S+:)?([^{]+)\s*(\{[^}]*\})?', inner)
-                    if m:
-                        name = m.group(1).strip()
-                        args = m.group(2) if m.group(2) else "{}"
-                        try:
-                            json.loads(args)
-                            yield ("__tool_calls__", [{"id": "tc_0", "function": {"name": name, "arguments": args}}])
-                        except (ValueError, Exception):
-                            yield (False, _content_buf[:end + len("<tool_call|>")])
-                    _content_buf = _content_buf[end + len("<tool_call|>"):]
-                elif not delta:
-                    if choice.get("finish_reason") == "tool_calls" and tool_accums:
-                        yield ("__tool_calls__", list(tool_accums.values()))
-                        return
-                    t = _parse_metrics(evt)
-                    if t:
-                        yield t
-
-# -------------------------------------------------------------
-#  Compaction (LLM-based, Qwen-style)
-# -------------------------------------------------------------
-COMPACT_SYSTEM = "\n".join([
-    "You are a context summarization assistant. Summarize the conversation",
-    "into a structured snapshot another LLM will use to continue work.",
-    "Do NOT continue the conversation. ONLY output the structured summary.",
-    "",
-    "First reason in <scratchpad>. Then produce:",
-    "<state_snapshot>",
-    "  <overall_goal>A single sentence for the objective.</overall_goal>",
-    "  <key_knowledge>Bullet list of crucial facts, constraints, build commands.</key_knowledge>",
-    "  <file_system_state>Files read, created, modified with paths.</file_system_state>",
-    "  <recent_actions>Last few significant actions and outcomes.</recent_actions>",
-    "  <current_plan>Step-by-step plan. [DONE], [IN PROGRESS], [TODO].</current_plan>",
-    "</state_snapshot>",
-])
-
-def _compact_history(messages, model):
-    n = len(messages)
-    keep_start = int(n * 0.7)
-    if keep_start < 2 or keep_start >= n:
-        return messages
-    to_compact = list(messages[:keep_start])
-    to_keep = list(messages[keep_start:])
-    text_parts = []
-    for m in to_compact:
-        role = m.get("role", "?")
-        c = (m.get("content") or "").strip()
-        if role == "tool":
-            c = "{}: {}".format(m.get("name", "?"), c[:300])
-        text_parts.append("[{}] {}".format(role, c[:500]))
-    compact_req = [
-        {"role": "user", "content": "Summarize:\n\n" + "\n".join(text_parts)},
-    ]
-    summary_text = ""
+def _error_body(error):
     try:
-        for chunk in chat_stream(compact_req, model, tools=None):
-            if isinstance(chunk, tuple) and len(chunk) == 2:
-                if not chunk[0]:
-                    summary_text += chunk[1]
+        body = error.read().decode("utf-8", errors="replace").strip()
+    except Exception:
+        return ""
+    if not body:
+        return ""
+    try:
+        data = json.loads(body)
+        if isinstance(data, dict):
+            detail = data.get("error", data)
+            if isinstance(detail, dict):
+                return detail.get("message") or json.dumps(detail)
+            return str(detail)
     except Exception:
         pass
-    start = summary_text.find("<state_snapshot>")
-    end = summary_text.find("</state_snapshot>")
-    if start != -1 and end != -1:
-        summary_text = summary_text[start:end + len("</state_snapshot>")]
-    else:
-        summary_text = summary_text[:1000]
-    return [{"role": "user", "content": "[CONTEXT SUMMARY]\n" + summary_text.strip() + "\n[/CONTEXT SUMMARY]"}] + to_keep
+    return body[:1000]
+
+def _format_chat_error(error):
+    if isinstance(error, urllib.error.HTTPError):
+        msg = "HTTP {} {}".format(error.code, error.reason)
+        body = _error_body(error)
+        if body:
+            msg += ": " + body
+        return msg
+    if isinstance(error, urllib.error.URLError):
+        return "Network error: {}".format(error.reason)
+    return "Streaming error: {}".format(error)
+
+def _compact_history(messages, model):
+    compact_model = model.get("_compact_model") or model
+    def summarize(system_prompt, user_prompt):
+        summary_text = ""
+        compact_req = [
+            {"role": "developer", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        try:
+            for chunk in chat_stream(compact_req, compact_model, tools=None):
+                if isinstance(chunk, tuple) and len(chunk) == 2:
+                    if not chunk[0]:
+                        summary_text += chunk[1]
+        except Exception:
+            return ""
+        return summary_text
+
+    return compact_history(messages, compact_model, summarize)
 
 # -------------------------------------------------------------
 #  Agent loop
 # -------------------------------------------------------------
-def _run_agent(messages, model, cancel_event, max_rounds=10):
+def _run_agent(messages, model, cancel=None, max_rounds=10):
     tools = TOOLS  # CLI always uses tools
+    had_error = False
     for _round in range(max_rounds):
         tool_calls = None
         streamed_content = ""
         streamed_reasoning = ""
+        content_escaper = MarkdownContentEscaper()
         print("\n# --- Agent ---")
-        for chunk in chat_stream(messages, model, cancel_event, tools=tools):
-            if isinstance(chunk, tuple) and chunk[0] == "__tool_calls__":
-                tool_calls = chunk[1]
-                break
-            if len(chunk) == 2:
-                is_reasoning, text = chunk
-                if is_reasoning:
-                    streamed_reasoning += text
+        try:
+            for chunk in chat_stream(messages, model, cancel, tools=tools):
+                if isinstance(chunk, tuple) and chunk[0] == "__tool_calls__":
+                    tool_calls = chunk[1]
+                    break
+                if len(chunk) == 2:
+                    is_reasoning, text = chunk
+                    if is_reasoning:
+                        streamed_reasoning += text
+                    else:
+                        streamed_content += text
+                        sys.stdout.write(content_escaper.feed(text))
+                        sys.stdout.flush()
                 else:
-                    streamed_content += text
-                    sys.stdout.write(text)
-                    sys.stdout.flush()
-            else:
-                break
-            if cancel_event.is_set():
-                break
-
-        if cancel_event.is_set() or not tool_calls:
+                    break
+                if cancel and cancel.is_set():
+                    break
+        except Exception as e:
+            pending_content = content_escaper.flush()
+            if pending_content:
+                sys.stdout.write(pending_content)
+                sys.stdout.flush()
+            error_msg = _format_chat_error(e)
+            print("\n[{}]".format(error_msg))
+            messages.append({"role": "assistant", "content": "Error: " + error_msg})
+            had_error = True
             break
 
-        msg = {"role": "assistant", "tool_calls": [{"id": tc["id"], "type": "function", "function": {"name": tc["function"]["name"], "arguments": tc["function"]["arguments"]}} for tc in tool_calls]}
-        content = streamed_content.strip()
-        if content:
-            msg["content"] = content
-        if streamed_reasoning.strip():
-            msg["reasoning_content"] = streamed_reasoning.strip()
-        messages.append(msg)
+        pending_content = content_escaper.flush()
+        if pending_content:
+            sys.stdout.write(pending_content)
+            sys.stdout.flush()
+
+        if had_error or (cancel and cancel.is_set()) or not tool_calls:
+            break
+
+        messages.append(assistant_tool_message(
+            tool_calls,
+            content=streamed_content.strip(),
+            reasoning=streamed_reasoning.strip(),
+        ))
         for tc in tool_calls:
-            if cancel_event.is_set():
+            if cancel and cancel.is_set():
                 break
             name = tc["function"]["name"]
             try:
                 args = json.loads(tc["function"]["arguments"]) if isinstance(tc["function"]["arguments"], str) else (tc["function"]["arguments"] or {})
             except Exception:
                 args = tc["function"]["arguments"]
-            output, _ = execute_tool(name, args, cancel=cancel_event, session_id="cli")
-            args_str = json.dumps(args) if isinstance(args, dict) else str(args)
-            print("\n# --- Tool ---\ntool_call_id: {}\nname: {}\nargs: {}\n{}".format(tc["id"], name, args_str, output))
-            messages.append({"role": "tool", "tool_call_id": tc["id"], "arguments": args_str, "content": output})
+            output, _ = execute_tool(name, args, cancel=cancel, session_id="cli")
+            tool_msg = tool_result_message(tc, args, output)
+            print("\n" + format_tool_block(
+                tool_msg.get("tool_call_id", ""),
+                tool_msg.get("name", ""),
+                tool_msg.get("arguments", "{}"),
+                tool_msg.get("content", ""),
+            ))
+            messages.append(tool_msg)
 
     # Auto-compact
     if model.get("auto_compact") and messages:
         est = sum(len(m.get("content", "")) for m in messages) // CHARS_PER_TOKEN
         if est > model.get("context", 32768) * 0.7:
-            sys.stderr.write("Compacting...\n")
+            compact_name = model.get("_compact_model", {}).get(
+                "_compact_model_name", "current")
+            sys.stderr.write("Compaction starting with {}...\n".format(
+                compact_name))
             sys.stderr.flush()
-            return _compact_history(messages, model)
-    return messages
+            compacted = _compact_history(messages, model)
+            _print_compaction_result(messages, compacted, automatic=True)
+            return compacted, had_error
+    return messages, had_error
 
-# -------------------------------------------------------------
-#  Input thread
-# -------------------------------------------------------------
-def _input_reader(in_queue, stopper):
-    while not stopper.is_set():
-        try:
-            line = sys.stdin.readline()
-            if not line:
-                stopper.set()
-                in_queue.put(None)
-                break
-            in_queue.put(line.rstrip("\n"))
-        except (EOFError, KeyboardInterrupt):
-            stopper.set()
-            in_queue.put(None)
-            break
+def _read_line(prompt):
+    sys.stdout.write(prompt)
+    sys.stdout.flush()
+    line = sys.stdin.readline()
+    return None if line == "" else line.rstrip("\n")
 
 # -------------------------------------------------------------
 #  Slash commands
 # -------------------------------------------------------------
-def _load_session(path, messages):
-    loaded = []
-    with open(path) as f:
-        sections = re.split(r'\n(?=# --- )', f.read())
-    for sec in sections:
-        sec = sec.strip()
-        if not sec:
-            continue
-        hdr_match = re.match(r'# --- (\w+) ---', sec)
-        if not hdr_match:
-            continue
-        role = hdr_match.group(1).lower()
-        body = sec[sec.index("\n")+1:].strip()
-        if role == "tool":
-            parts = body.split("\n", 3)
-            tc_id = parts[0].replace("tool_call_id: ", "") if len(parts) > 0 else ""
-            tname = parts[1].replace("name: ", "") if len(parts) > 1 else ""
-            targs = parts[2].replace("args: ", "") if len(parts) > 2 else ""
-            content = parts[3] if len(parts) > 3 else ""
-            loaded.append({"role": "tool", "tool_call_id": tc_id, "name": tname,
-                           "arguments": targs, "content": content})
-        else:
-            loaded.append({"role": role, "content": body})
-    if loaded and loaded[0]["role"] == "system":
-        loaded[0]["role"] = "developer"
+def _load_session(path, messages, config=None, cwd=None):
+    with open(path, encoding="utf-8", errors="replace") as f:
+        loaded = parse_chat(f.read())
     if loaded:
+        if config is not None:
+            _apply_agents_md(loaded, config, cwd or os.getcwd())
         messages[:] = loaded
 
 def _print_messages(messages):
     """Print conversation in markdown format."""
-    for m in messages:
-        role = m.get("role", "?")
-        c = m.get("content", "")
-        if role == "developer":
-            role = "system"
-        if role == "tool":
-            c = "tool_call_id: {}\nname: {}\nargs: {}\n{}".format(
-                m.get("tool_call_id", ""), m.get("name", "?"),
-                m.get("arguments", "{}"), c)
-        print("# --- {} ---\n{}".format(role.title(), c))
+    text = format_chat(messages)
+    if text:
+        print(text)
     print()
+
+def _print_compaction_result(old_messages, new_messages, automatic=False):
+    if new_messages == old_messages:
+        print("[Context unchanged]")
+        return False
+    print("[Context compacted automatically]" if automatic else "[Context compacted]")
+    _print_messages(new_messages)
+    return True
 
 def _handle_slash(cmd, messages, model, config, session_dir):
     parts = cmd.split(None, 1)
@@ -413,13 +334,19 @@ def _handle_slash(cmd, messages, model, config, session_dir):
         execute_tool("reset", {}, session_id="cli")
         print("[New conversation]")
     elif op == "/compact":
-        messages[:] = _compact_history(messages, model)
-        print("[Context compacted]")
+        compact_name = model.get("_compact_model", {}).get(
+            "_compact_model_name", "current")
+        sys.stderr.write("Compaction starting with {}...\n".format(
+            compact_name))
+        sys.stderr.flush()
+        compacted = _compact_history(messages, model)
+        if _print_compaction_result(messages, compacted):
+            messages[:] = compacted
     elif op == "/model":
         models = config.get("models", {})
         if arg in models:
             model.clear()
-            model.update(models[arg])
+            model.update(_apply_config_to_model(dict(models[arg]), config))
             print("[Model: {}]".format(arg))
         else:
             print("[Available models: {}]".format(", ".join(models.keys())))
@@ -427,15 +354,9 @@ def _handle_slash(cmd, messages, model, config, session_dir):
         ts = time.strftime("%Y-%m-%d_%H-%M")
         name = ts + ("-" + arg if arg else "")
         path = os.path.join(session_dir, name + ".md")
-        with open(path, "w") as f:
-            for m in messages:
-                role = m.get("role", "?")
-                c = m.get("content", "")
-                if role == "tool":
-                    c = "tool_call_id: {}\nname: {}\nargs: {}\n{}".format(
-                        m.get("tool_call_id", ""), m.get("name", "?"),
-                        m.get("arguments", "{}"), c)
-                f.write("# --- {} ---\n{}\n\n".format(role.title(), c))
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(format_chat(messages))
+            f.write("\n")
         print("[Saved to .Agentic/{}]".format(os.path.basename(path)))
     elif op == "/load":
         files = sorted([f for f in os.listdir(session_dir) if f.endswith(".md")],
@@ -451,7 +372,7 @@ def _handle_slash(cmd, messages, model, config, session_dir):
         elif arg.isdigit():
             idx = int(arg) - 1
             if 0 <= idx < len(files):
-                _load_session(os.path.join(session_dir, files[idx]), messages)
+                _load_session(os.path.join(session_dir, files[idx]), messages, config, os.getcwd())
                 _print_messages(messages)
                 print("[Loaded {}]".format(files[idx][:-3]))
             else:
@@ -461,7 +382,7 @@ def _handle_slash(cmd, messages, model, config, session_dir):
             if not matches:
                 print("[No session matching '{}']".format(arg))
             elif len(matches) == 1:
-                _load_session(os.path.join(session_dir, matches[0]), messages)
+                _load_session(os.path.join(session_dir, matches[0]), messages, config, os.getcwd())
                 _print_messages(messages)
                 print("[Loaded {}]".format(matches[0][:-3]))
             else:
@@ -493,50 +414,44 @@ def _handle_slash(cmd, messages, model, config, session_dir):
 #  Main
 # -------------------------------------------------------------
 def main():
+    args = _parse_args(sys.argv[1:])
     config = _load_config()
-    models = config.get("models", {})
-    first_key = next(iter(models))
-    model = dict(models[first_key])
+    model_key, model = _select_model(config, args.model_name)
+    model = _apply_config_to_model(model, config)
     prompt = config.get("default_prompt", "You are an expert coding agent.")
-    enable_comp = config.get("auto_compact", False)
-    if enable_comp:
-        model["auto_compact"] = True
 
     session_dir = os.path.join(os.getcwd(), ".Agentic")
     os.makedirs(session_dir, exist_ok=True)
 
     messages = [{"role": "developer", "content": prompt}]
-    cancel_event = threading.Event()
-    in_queue = queue.Queue()
-    stopper = threading.Event()
+    _apply_agents_md(messages, config, os.getcwd())
 
-    signal.signal(signal.SIGINT, lambda s, f: cancel_event.set())
+    print(format_chat([messages[0]]))
+    print()
+    print("Model: {} ({}) | Context: {} | Tools: {} | /help for commands\n".format(
+        model_key, model.get("model"), model.get("context", "?"), len(TOOLS)))
 
-    reader = threading.Thread(target=_input_reader, args=(in_queue, stopper), daemon=True)
-    reader.start()
+    query = args.query
+    if query is None and args.prompt:
+        query = " ".join(args.prompt)
 
-    print("# --- System ---\n{}\n".format(prompt))
-    print("Model: {} | Context: {} | Tools: {} | /help for commands\n".format(
-        model.get("model"), model.get("context", "?"), len(TOOLS)))
-
-    # If launched with arguments, treat as initial command
-    if len(sys.argv) > 1:
-        init_cmd = " ".join(sys.argv[1:])
-        print("\n# --- User ---\n{}".format(init_cmd))
-        messages.append({"role": "user", "content": init_cmd})
-        cancel_event.clear()
+    if query:
+        print("\n" + format_chat([{"role": "user", "content": query}]))
+        messages.append({"role": "user", "content": query})
         print()
-        messages = _run_agent(messages, model, cancel_event)
+        try:
+            messages, had_error = _run_agent(messages, model)
+        except KeyboardInterrupt:
+            print("\n[Interrupted]")
+            return 130
         print()
-        if cancel_event.is_set():
-            print("[Interrupted]")
-        cancel_event.clear()
+        if had_error:
+            return 1
+        return 0
 
     try:
-        while not stopper.is_set():
-            sys.stdout.write("> ")
-            sys.stdout.flush()
-            user_input = in_queue.get()
+        while True:
+            user_input = _read_line("> ")
             if user_input is None:
                 break
             if not user_input.strip():
@@ -548,35 +463,34 @@ def main():
 
             # Collect multi-line input: read until blank line
             lines = [user_input]
+            eof = False
             while True:
-                sys.stdout.write("| ")
-                sys.stdout.flush()
-                line = in_queue.get()
+                line = _read_line("| ")
                 if line is None:
-                    stopper.set()
+                    eof = True
                     break
                 if line.strip() == "":
                     break
                 lines.append(line)
-            if stopper.is_set():
+            if eof:
                 break
             user_input = "\n".join(lines)
 
-            print("\n# --- User ---\n{}".format(user_input))
+            print("\n" + format_chat([{"role": "user", "content": user_input}]))
             messages.append({"role": "user", "content": user_input})
 
-            cancel_event.clear()
             print()
-            messages = _run_agent(messages, model, cancel_event)
+            messages, had_error = _run_agent(messages, model)
             print()
 
-            if cancel_event.is_set():
-                print("[Interrupted]")
+            if had_error:
+                print("[Request failed]")
     except KeyboardInterrupt:
-        cancel_event.set()
+        print("\n[Interrupted]")
+        return 130
     finally:
-        stopper.set()
         print("Goodbye.")
+    return 0
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

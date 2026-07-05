@@ -34,58 +34,77 @@
 #  The plugin uses only Python features available in older
 #  Sublime Text builds (no f-string syntax, only .format()).
 # -------------------------------------------------------------
-import sys
 import os
 import time
 import json
-import urllib.request
-import urllib.error
 import threading
-import random
 import re
+import importlib
 
-from .agentic_tools import TOOLS, execute_tool
+from .lib import agentic_client as _client
+from .lib import agentic_compaction as _compaction
+from .lib import agentic_markdown as _markdown
+from .lib import agentic_project as _project
+from .lib import agentic_tools as _tools
+
+for _module in (_markdown, _client, _compaction, _project):
+    importlib.reload(_module)
+
+TOOLS = _tools.TOOLS
+execute_tool = _tools.execute_tool
+stream_chat = _client.stream_chat
+COMPACT_SYSTEM = _compaction.COMPACT_SYSTEM
+SUMMARY_PREFIX = _compaction.SUMMARY_PREFIX
+SUMMARY_SUFFIX = _compaction.SUMMARY_SUFFIX
+build_summary_prompt = _compaction.build_summary_prompt
+compact_history = _compaction.compact_history
+copy_compaction_settings = _compaction.copy_compaction_settings
+clip_tool_outputs = _compaction.clip_tool_outputs
+split_history = _compaction.split_history
+MarkdownContentEscaper = _markdown.MarkdownContentEscaper
+assistant_tool_message = _markdown.assistant_tool_message
+escape_content = _markdown.escape_content
+format_chat = _markdown.format_chat
+format_tool_block = _markdown.format_tool_block
+parse_chat = _markdown.parse_chat
+tool_result_message = _markdown.tool_result_message
+apply_project_agents_md = _project.apply_agents_md
+project_folder_for_path = _project.project_folder_for_path
 
 import sublime
 import sublime_plugin
 
 CHARS_PER_TOKEN = 4.4  # Based on python+english data
 
-# Registry of ongoing streams: view.id() -> StreamingTask
+# Registry of cancellable background tasks: view.id() -> task
 _ACTIVE_STREAMERS = {}
-
-# Tags for chat file
-TAG_MAP = {
-    "developer": "# --- System ---",
-    "user": "# --- User ---",
-    "assistant": "# --- Agent ---",
-    "tool": "# --- Tool ---",
-}
 
 _LAST_SANITIZE_DICT_RAW = None
 _SANITIZE_DICT = None
 _SANITIZE_RE = None
 _LAST_MODEL_IDX = {}
 
+def _unregister_task(registry, view, task):
+    if registry.get(view.id()) is task:
+        registry.pop(view.id(), None)
+
 def _printstatus(msg):
     sublime.status_message(msg)
     if sublime.load_settings("Agentic.sublime-settings").get("console_log", False):
         print(msg)
 
-def _load_agents_md(window):
-    """Load AGENTS.md from the first project folder, if enabled."""
-    settings = sublime.load_settings("Agentic.sublime-settings")
-    if not settings.get("enable_agents_md"):
+def _project_folder_for_view(view):
+    window = view.window() if view else None
+    if not window:
         return None
-    for folder in window.folders():
-        path = os.path.join(folder, "AGENTS.md")
-        if os.path.isfile(path):
-            try:
-                with open(path, "r", encoding="utf-8", errors="replace") as f:
-                    return f.read()
-            except Exception:
-                continue
-    return None
+    return project_folder_for_path(view.file_name(), window.folders())
+
+def _apply_agents_md(messages, view):
+    settings = sublime.load_settings("Agentic.sublime-settings")
+    return apply_project_agents_md(
+        messages,
+        _project_folder_for_view(view),
+        enabled=settings.get("enable_agents_md", True))
 
 def _pick_model(capability=None):
     """Return a random model from the provided model list string"""
@@ -93,7 +112,6 @@ def _pick_model(capability=None):
     if capability is None:
         capability = settings.get("default_models")
     capable_models = settings.get(capability)
-    models = settings.get("models")
 
     # round robin request load balancing
     if capability not in _LAST_MODEL_IDX:
@@ -106,25 +124,15 @@ def _pick_model(capability=None):
     return model
 
 
-def _parse_metrics(r):
-    """
-    Return (cache_n, prompt_n, prompt_per_sec, predicted_per_sec)
-    from either a "timings" block or the older "usage" block.
-    """
-    t = r.get("timings")
-    if t:
-        return (t["cache_n"], t["prompt_n"],
-                t["prompt_per_second"], t["predicted_per_second"])
-    u = r.get("usage")  # groq / openai
-    if u:
-        cache = u.get("prompt_tokens_details", {}).get("cached_tokens", 0)
-        prompt = u.get("prompt_tokens", 0) - cache
-        pt = u.get("prompt_time", 0) or 1e12
-        ct = u.get("completion_time", 0) or 1e12
-        return (cache, prompt,
-                u.get("prompt_tokens", 0) / pt,
-                u.get("completion_tokens", 0) / ct)
-    return None
+def _pick_compact_model(models, fallback_name=None):
+    settings = sublime.load_settings("Agentic.sublime-settings")
+    capability = settings.get("default_models_compact", "models_low")
+    model_name = _pick_model(capability) if settings.get(capability) else None
+    if model_name not in models:
+        model_name = fallback_name
+    if model_name not in models:
+        model_name = _pick_model()
+    return model_name, copy_compaction_settings(models.get(model_name, {}), settings)
 
 
 def chat_stream(messages, model, cancel=None, tools=None):
@@ -135,177 +143,18 @@ def chat_stream(messages, model, cancel=None, tools=None):
     At the end yields a 4-tuple of timing metrics:
         (cache_n, prompt_n, prompt_per_second, predicted_per_second).
     """
-    url = model.get("url")
-    token = model.get("token")
-    body = dict(model.get("options", {}))
-    body.update({
-        "messages": messages,
-        "model": model.get("model"),
-    })
-
-    if tools:
-        body["tools"] = tools
-
-    # some local models (EXAONE) do not support "developer"
-    if model.get("no_system_prompt", False):
-        for m in body.get("messages"):
-            if m['role'] == "developer":
-                m['role'] = "user"
-
-    if "include_reasoning" in body and body["include_reasoning"]:
-        body.update({  # match the package setting if True
-            "include_reasoning":
-            sublime.load_settings("Agentic.sublime-settings").get("show_reasoning")
-        })
-
-    stream = body.get("stream", False)
-
-    data = json.dumps(body).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=data,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": "Bearer {}".format(token),
-            "User-Agent": "AsyncAPIClient/Python 2.14.0"
-        },
-    )
-
-    if not stream:
-        try:
-            resp = urllib.request.urlopen(req)
-        except urllib.error.HTTPError as e:
-            print("HTTP Error {}: {}".format(e.code, e.reason))
-            raise e
-        resp = json.loads(''.join([r.decode("utf-8") for r in resp]))
-        m = resp["choices"][0]["message"]
-        if "reasoning_content" in m and m["reasoning_content"]:
-            yield (True, m["reasoning_content"])
-        elif "reasoning" in m and m["reasoning"]:  # groq
-            yield (True, m["reasoning"])
-        if "content" in m:
-            content = m["content"]
-            start = content.find("<|tool_call>")
-            if start != -1:
-                end = content.find("<tool_call|>", start)
-                if end != -1:
-                    prefix = content[:start]
-                    if prefix.strip():
-                        yield (False, prefix)
-                    inner = content[start + len("<|tool_call>"):end]
-                    mm = re.search(r'call:\s*(?:\S+:)?([^{]+)\s*(\{[^}]*\})?', inner)
-                    if mm:
-                        name = mm.group(1).strip()
-                        args = mm.group(2) if mm.group(2) else "{}"
-                        try:
-                            json.loads(args)
-                            yield ("__tool_calls__", [{"id": "tc_0", "function": {"name": name, "arguments": args}}])
-                            return
-                        except (ValueError, Exception):
-                            pass
-            yield (False, content)
-
-        # Tool calls in non-streaming response
-        if m.get("tool_calls"):
-            yield ("__tool_calls__", [
-                {
-                    "id": tc["id"],
-                    "function": {
-                        "name": tc["function"]["name"],
-                        "arguments": tc["function"]["arguments"],
-                    },
-                }
-                for tc in m["tool_calls"]
-            ])
-            return
-
-        t = _parse_metrics(resp)
-        if t:
-            yield (t)
-        return
-
-    with urllib.request.urlopen(req) as resp:
-        tool_accums = {}  # index -> {id, function: {name, arguments}}
-        _content_buf = ""
-        for raw in resp:
-            if cancel and cancel.is_set():
-                return
-            line = raw.decode("utf-8").strip()
-            if not line.startswith("data: "):
-                continue
-            payload = line[6:]
-            if payload == "[DONE]":
-                if tool_accums:
-                    yield ("__tool_calls__", list(tool_accums.values()))
-                return
-
-            try:
-                evt = json.loads(payload)
-            except ValueError:
-                continue
-
-            for choice in evt.get("choices", []):
-                delta = choice.get("delta", {})
-
-                # Accumulate streaming tool_call fragments by index
-                if "tool_calls" in delta:
-                    for tc in delta["tool_calls"]:
-                        idx = tc["index"]
-                        if idx not in tool_accums:
-                            tool_accums[idx] = {
-                                "id": "",
-                                "function": {"name": "", "arguments": ""},
-                            }
-                        acc = tool_accums[idx]
-                        if "id" in tc:
-                            acc["id"] = tc["id"]
-                        if "function" in tc:
-                            if "name" in tc["function"]:
-                                acc["function"]["name"] = tc["function"]["name"]
-                            if "arguments" in tc["function"]:
-                                acc["function"]["arguments"] += tc["function"]["arguments"]
-                    continue
-
-                if choice.get("finish_reason") == "tool_calls" and tool_accums:
-                    yield ("__tool_calls__", list(tool_accums.values()))
-                    return
-
-                # Harvest content / reasoning tokens
-                if "reasoning_content" in delta and delta["reasoning_content"]:
-                    yield (True, delta["reasoning_content"])
-                elif "reasoning" in delta and delta["reasoning"]:  # groq
-                    yield (True, delta["reasoning"])
-                elif "content" in delta and delta["content"]:
-                    _content_buf += delta["content"]
-                    start = _content_buf.find("<|tool_call>")
-                    if start == -1:
-                        yield (False, _content_buf)
-                        _content_buf = ""
-                        continue
-                    end = _content_buf.find("<tool_call|>", start)
-                    if end == -1:
-                        continue
-                    prefix = _content_buf[:start]
-                    if prefix.strip():
-                        yield (False, prefix)
-                    inner = _content_buf[start + len("<|tool_call>"):end]
-                    m = re.search(r'call:\s*(?:\S+:)?([^{]+)\s*(\{[^}]*\})?', inner)
-                    if m:
-                        name = m.group(1).strip()
-                        args = m.group(2) if m.group(2) else "{}"
-                        try:
-                            json.loads(args)
-                            yield ("__tool_calls__", [{"id": "tc_0", "function": {"name": name, "arguments": args}}])
-                        except (ValueError, Exception):
-                            yield (False, _content_buf[:end + len("<tool_call|>")])
-                    _content_buf = _content_buf[end + len("<tool_call|>"):]
-                elif not delta:  # Final timing report or tool_calls finish
-                    if choice.get("finish_reason") == "tool_calls" and tool_accums:
-                        yield ("__tool_calls__", list(tool_accums.values()))
-                        return
-                    t = _parse_metrics(evt)
-                    if t:
-                        yield (t)
+    include_reasoning = None
+    options = model.get("options", {})
+    if options.get("include_reasoning"):
+        include_reasoning = sublime.load_settings(
+            "Agentic.sublime-settings").get("show_reasoning")
+    return stream_chat(
+        messages,
+        model,
+        cancel=cancel,
+        tools=tools,
+        include_reasoning=include_reasoning,
+        user_agent="AsyncAPIClient/Python 2.14.0")
 
 
 class AgentStreamingTask(threading.Thread):
@@ -334,27 +183,11 @@ class AgentStreamingTask(threading.Thread):
         prev_reasoning = False
         cache, tps = (0.0, None)  # default empty performance
 
-        # Inject AGENTS.md from project folder into system prompt (once)
-        window = self.view.window()
-        agents_md = _load_agents_md(window) if window else None
-        if agents_md and self.messages:
-            sys_msg = self.messages[0].get("content", "")
-            if "AGENTS.md instructions" not in sys_msg:
-                self.messages[0]["content"] = (
-                    sys_msg
-                    + "\n\n"
-                    + "Project AGENTS.md instructions:\n\n"
-                    + "`````````\n"
-                    + agents_md
-                    + "\n`````````"
-                )
+        # Inject project AGENTS.md into the developer/system prompt once.
+        _apply_agents_md(self.messages, self.view)
 
         # Detect project root for relative path resolution
-        cwd = None
-        if window:
-            folders = window.folders()
-            if folders:
-                cwd = folders[0]
+        cwd = _project_folder_for_view(self.view)
 
         if self.view.settings().get("agent_model") is None:
             self.view.settings().set("agent_model", _pick_model())
@@ -379,6 +212,7 @@ class AgentStreamingTask(threading.Thread):
                 prev_reasoning = False
                 streamed_content = ""
                 streamed_reasoning = ""
+                content_escaper = MarkdownContentEscaper()
                 self._write("\n\n# --- Agent ---\n")
                 for chunk in chat_stream(self.messages, model, self._cancel_event, tools=tooling):
                     if isinstance(chunk, tuple) and chunk[0] == "__tool_calls__":
@@ -410,32 +244,22 @@ class AgentStreamingTask(threading.Thread):
                             self._write("\n\n## --- Response ---\n")
                             prev_reasoning = False
                         streamed_content += text
+                        text = content_escaper.feed(text)
                     self._write(text)
+
+                pending_content = content_escaper.flush()
+                if pending_content:
+                    self._write(pending_content)
 
                 if self._cancel_event.is_set() or not tool_calls:
                     break
 
                 # Insert assistant message with tool_calls (required by OpenAI API protocol)
-                msg = {
-                    "role": "assistant",
-                    "tool_calls": [
-                        {
-                            "id": tc["id"],
-                            "type": "function",
-                            "function": {
-                                "name": tc["function"]["name"],
-                                "arguments": tc["function"]["arguments"],
-                            },
-                        }
-                        for tc in tool_calls
-                    ],
-                }
-                content = streamed_content.strip()
-                if content:
-                    msg["content"] = content
-                if streamed_reasoning.strip():
-                    msg["reasoning_content"] = streamed_reasoning.strip()
-                self.messages.append(msg)
+                self.messages.append(assistant_tool_message(
+                    tool_calls,
+                    content=streamed_content.strip(),
+                    reasoning=streamed_reasoning.strip(),
+                ))
 
                 # Execute accumulated tool calls
                 for tc in tool_calls:
@@ -456,19 +280,17 @@ class AgentStreamingTask(threading.Thread):
                         cwd=cwd,
                         session_id=str(self.view.id()))
 
-                    args_str = json.dumps(args) if isinstance(args, dict) else str(args)
-                    self._write("\n# --- Tool ---\ntool_call_id: {}\nname: {}\nargs: {}\n".format(
-                        tc["id"], name, args_str))
-                    self._write(output)
+                    tool_msg = tool_result_message(tc, args, output)
+                    self._write("\n")
+                    self._write(format_tool_block(
+                        tool_msg.get("tool_call_id", ""),
+                        tool_msg.get("name", ""),
+                        tool_msg.get("arguments", "{}"),
+                        tool_msg.get("content", ""),
+                    ))
                     self._write("\n")
 
-                    self.messages.append({
-                        "role": "tool",
-                        "tool_call_id": tc["id"],
-                        "name": name,
-                        "arguments": args_str,
-                        "content": output,
-                    })
+                    self.messages.append(tool_msg)
 
         except Exception as e:
             error_msg = "Streaming Error: {}".format(str(e))
@@ -500,9 +322,11 @@ class AgentStreamingTask(threading.Thread):
             est_tokens = sum(len(m.get("content") or "") for m in self.messages) // 4
             context_limit = model.get("context", 128000)
             if est_tokens > context_limit * 0.7:
-                _printstatus("Compacting context ({:.0f}% used)...".format(
-                    float(est_tokens) / context_limit * 100))
-                self.messages = _compact_history(self.messages, model)
+                compact_model_name, compact_model = _pick_compact_model(
+                    models, model_name)
+                _printstatus("Compacting context with {} ({:.0f}% used)...".format(
+                    compact_model_name, float(est_tokens) / context_limit * 100))
+                self.messages = _compact_history(self.messages, compact_model)
 
         ## Estimate and print usage based on elapsed time
         if not tps:
@@ -560,11 +384,130 @@ class AgentStreamingTask(threading.Thread):
         )
 
     def _finalize(self):
+        _unregister_task(self.registry, self.view, self)
         if not self.is_valid():
             return
-        self.registry.pop(self.view.id(), None)
         self._write("\n\n# --- User ---\n")
         self.view.settings().set("agentic_is_streaming", False)
+
+
+class AgentCompactionTask(threading.Thread):
+    """Background worker - compacts a chat without blocking Sublime."""
+    operation = "Compaction"
+
+    def __init__(self, source_view, target_view, head, middle, tail,
+                 model_name, model, behavior, registry, stream_to_view):
+        super().__init__(daemon=True)
+        self.source_view = source_view
+        self.view = target_view
+        self.head = head
+        self.middle = middle
+        self.tail = tail
+        self.model_name = model_name
+        self.model = model
+        self.behavior = behavior
+        self.registry = registry
+        self.stream_to_view = stream_to_view
+        self._cancel_event = threading.Event()
+        self._buffer = []
+        self._pending = False
+        self._closed = False
+
+    def cancel(self):
+        self._cancel_event.set()
+        self.view.settings().set("agentic_is_streaming", False)
+
+    def is_valid(self):
+        return self.view and self.view.is_valid() \
+                and self.view.window() and self.view.window().is_valid()
+
+    def run(self):
+        summary_text = ""
+        content_escaper = MarkdownContentEscaper()
+        summary_request = [
+            {"role": "developer", "content": COMPACT_SYSTEM},
+            {"role": "user", "content": build_summary_prompt(self.middle, self.model)},
+        ]
+        try:
+            for chunk in chat_stream(
+                    summary_request, self.model, self._cancel_event, tools=None):
+                if self._cancel_event.is_set():
+                    break
+                if isinstance(chunk, tuple) and len(chunk) == 2:
+                    is_reasoning, text = chunk
+                    if is_reasoning:
+                        continue
+                    summary_text += text
+                    if self.stream_to_view:
+                        self._write(content_escaper.feed(text))
+        except Exception as e:
+            sublime.set_timeout(lambda: self._finish(None, str(e)), 0)
+            return
+
+        if self.stream_to_view:
+            pending = content_escaper.flush()
+            if pending:
+                self._write(pending)
+
+        compacted = _compacted_messages(
+            self.head, summary_text, self.tail, self.model)
+        sublime.set_timeout(lambda: self._finish(compacted, None), 0)
+
+    def _write(self, text):
+        if not text or self._closed:
+            return
+        self._buffer.append(text)
+        if not self._pending:
+            self._pending = True
+            sublime.set_timeout(self.__flush, 25)
+
+    def __flush(self):
+        self._pending = False
+        if self._closed or not self.is_valid():
+            self._buffer = []
+            return
+        parts = []
+        while self._buffer:
+            parts.append(self._buffer.pop())
+        if parts:
+            self.view.run_command("append", {"characters": "".join(parts[::-1])})
+
+    def _finish(self, compacted, error):
+        self._closed = True
+        self._buffer = []
+        if self.is_valid():
+            self.view.settings().set("agentic_is_streaming", False)
+        _unregister_task(self.registry, self.view, self)
+
+        if self._cancel_event.is_set():
+            _printstatus("Compaction cancelled.")
+            return
+        if not self.is_valid():
+            return
+        if error:
+            if self.stream_to_view and self.is_valid():
+                self.view.run_command(
+                    "append",
+                    {"characters": "\n\n[Compaction failed: {}]\n".format(error)})
+            _printstatus("Chat compaction failed: {}".format(error))
+            return
+        if not compacted:
+            _printstatus("Chat compaction did not change context")
+            return
+
+        continuation = _rebuild_text(compacted) + "\n\n# --- User ---\n"
+        if self.behavior == "replace":
+            self.source_view.run_command("select_all")
+            self.source_view.run_command("insert", {"characters": continuation})
+            _printstatus("Chat compacted")
+            return
+
+        self.view.run_command("select_all")
+        self.view.run_command("insert", {"characters": continuation})
+        self.view.set_name("Chat compacted")
+        if self.model_name:
+            self.view.settings().set("agent_model", self.model_name)
+        _printstatus("Compacted chat created")
 
 
 def start_streaming(view, messages, model_name=None):
@@ -578,201 +521,59 @@ def start_streaming(view, messages, model_name=None):
 
 
 def _build_messages_from_text(text):
-    """Parse a view into a list of chat messages"""
-    lines = text.splitlines(True)
-
-    messages = []
-    current_role = None
-    content_lines = []
-    in_reasoning = False
-
-    for line in lines:
-        stripped = line.strip()
-
-        # Block start
-        if stripped.startswith("# --- "):
-            if current_role and content_lines:
-                msg = "".join(content_lines).rstrip("\n")
-                if current_role == "tool":
-                    # Parse tool header lines: tool_call_id + name, rest is output
-                    parts = msg.split("\n", 3)
-                    tc_id = parts[0].replace("tool_call_id: ", "").strip() if len(parts) > 0 else ""
-                    tname = parts[1].replace("name: ", "").strip() if len(parts) > 1 else ""
-                    targs = parts[2].replace("args: ", "").strip() if len(parts) > 2 else ""
-                    content = parts[3] if len(parts) > 3 else ""
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tc_id,
-                        "name": tname,
-                        "content": content,
-                    })
-                    # Inject tool_calls into the preceding assistant message
-                    for i in range(len(messages) - 2, -1, -1):
-                        if messages[i]["role"] == "assistant":
-                            if "tool_calls" not in messages[i]:
-                                messages[i]["tool_calls"] = []
-                            messages[i]["tool_calls"].append({
-                                "id": tc_id,
-                                "type": "function",
-                                "function": {
-                                    "name": tname,
-                                    "arguments": targs,
-                                },
-                            })
-                            break
-                else:
-                    messages.append({"role": current_role, "content": msg})
-
-            if "System" in stripped:
-                current_role = "developer"
-            elif "User" in stripped:
-                current_role = "user"
-            elif "Agent" in stripped:
-                current_role = "assistant"
-            elif "Tool" in stripped:
-                current_role = "tool"
-            else:
-                current_role = None
-
-            content_lines = []
-            continue
-
-        # Reasoning section toggles
-        if stripped.startswith("## --- "):
-            if "Thinking" in stripped:
-                in_reasoning = True
-            elif "Response" in stripped:
-                in_reasoning = False
-            continue
-
-        if in_reasoning:
-            continue
-
-        if current_role:
-            content_lines.append(line)
-
-    # Finalise the last block
-    if current_role and content_lines:
-        msg = "".join(content_lines).rstrip("\n")
-        if current_role == "tool":
-            parts = msg.split("\n", 3)
-            tc_id = parts[0].replace("tool_call_id: ", "").strip() if len(parts) > 0 else ""
-            tname = parts[1].replace("name: ", "").strip() if len(parts) > 1 else ""
-            targs = parts[2].replace("args: ", "").strip() if len(parts) > 2 else ""
-            content = parts[3] if len(parts) > 3 else ""
-            messages.append({"role": "tool", "tool_call_id": tc_id, "name": tname, "content": content})
-            for i in range(len(messages) - 2, -1, -1):
-                if messages[i]["role"] == "assistant":
-                    if "tool_calls" not in messages[i]:
-                        messages[i]["tool_calls"] = []
-                    messages[i]["tool_calls"].append({
-                        "id": tc_id, "type": "function",
-                        "function": {"name": tname, "arguments": targs},
-                    })
-                    break
-        else:
-            messages.append({"role": current_role, "content": msg})
-
-    return messages
+    """Parse a view into a list of chat messages."""
+    return parse_chat(text)
 
 
 def _rebuild_text(messages, strip_active=False):
-    """Reconstructs chat text from message list"""
-    if not messages:
-        return ""
-    parts = []
-    for m in messages:
-        tag = TAG_MAP.get(m["role"])
-        if not tag:
-            continue
-        if m["role"] == "tool":
-            header = "tool_call_id: {}\nname: {}\nargs: {}\n".format(
-                m.get("tool_call_id", ""),
-                m.get("name", ""),
-                m.get("arguments", "{}"),
-            )
-            parts.append("{}\n{}{}\n".format(tag, header, m["content"].strip()))
-        else:
-            parts.append("{}\n{}\n".format(tag, m["content"].strip()))
-    if strip_active and parts[-1].startswith(TAG_MAP["assistant"]) \
-            and len(parts[-1]) < 19:
-        parts = parts[:-1]
-    return "\n".join(parts)[:-1]
+    """Reconstruct chat text from a message list."""
+    return format_chat(messages, strip_active=strip_active)
 
 
-COMPACT_SYSTEM = "\n".join([
-    "You are a context summarization assistant. Task: summarize the conversation",
-    "between a user and an AI coding agent into a structured snapshot that",
-    "another LLM will use to continue the work. Do NOT continue the conversation.",
-    "Do NOT respond to any questions in the conversation. ONLY output the",
-    "structured summary below.",
-    "",
-    "First, reason privately in <scratchpad>. Then produce this exact format:",
-    "",
-    "<state_snapshot>",
-    "  <overall_goal>",
-    "    A single sentence describing the high-level objective.",
-    "  </overall_goal>",
-    "  <key_knowledge>",
-    "    - Crucial facts, conventions, build commands, constraints.",
-    "    - File paths that were read or modified.",
-    "  </key_knowledge>",
-    "  <file_system_state>",
-    "    - Files read, created, modified with paths and status.",
-    "  </file_system_state>",
-    "  <recent_actions>",
-    "    - Last few significant actions and their outcomes.",
-    "  </recent_actions>",
-    "  <current_plan>",
-    "    Step-by-step plan. Mark: [DONE], [IN PROGRESS], [TODO].",
-    "  </current_plan>",
-    "</state_snapshot>",
-])
-
-
-def _compact_history(messages, model):
-    """LLM-based compaction: preserve last ~30%, summarize older ~70%.
-    Returns a new message list with the summary replacing old messages."""
-    n = len(messages)
-    keep_start = int(n * 0.7)
-    if keep_start < 2 or keep_start >= n:
-        return messages
-
-    to_compact = list(messages[:keep_start])
-    to_keep = list(messages[keep_start:])
-
-    # Serialize old messages using the same markdown format
-    compact_text = _rebuild_text(to_compact)
-    summary_request = [
-        {"role": "developer", "content": COMPACT_SYSTEM},
-        {"role": "user", "content": "Summarize this conversation history:\n\n" + compact_text},
-    ]
-
-    # Call model non-streaming, no tools, to get the summary
-    summary_text = ""
-    try:
-        for chunk in chat_stream(summary_request, model, tools=None):
-            if isinstance(chunk, tuple) and len(chunk) == 2:
-                is_reasoning, text = chunk
-                if not is_reasoning:
-                    summary_text += text
-    except Exception:
-        pass
-
-    # Extract snapshot from response
+def _compacted_messages(head, summary_text, tail, model):
+    summary_text = summary_text or ""
     start = summary_text.find("<state_snapshot>")
     end = summary_text.find("</state_snapshot>")
     if start != -1 and end != -1:
-        summary_text = summary_text[start:end + len("</state_snapshot>")]
+        summary_text = summary_text[start:end + len("</state_snapshot>")].strip()
     else:
-        summary_text = summary_text[:2000]
-
-    result = [{
+        summary_text = summary_text[:4000].strip()
+    if not summary_text:
+        return None
+    result = clip_tool_outputs(head, model)
+    result.append({
         "role": "user",
-        "content": "[CONTEXT SUMMARY]\n" + summary_text.strip() + "\n[/CONTEXT SUMMARY]",
-    }]
-    result.extend(to_keep)
+        "content": SUMMARY_PREFIX + "\n" + summary_text + "\n" + SUMMARY_SUFFIX,
+    })
+    result.extend(clip_tool_outputs(tail, model))
     return result
+
+
+def _compact_history(messages, model, cancel=None):
+    """LLM-based compaction: keep head/tail, summarize middle."""
+    settings = sublime.load_settings("Agentic.sublime-settings")
+    compact_model = copy_compaction_settings(model, settings)
+
+    def summarize(system_prompt, user_prompt):
+        summary_text = ""
+        summary_request = [
+            {"role": "developer", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        try:
+            for chunk in chat_stream(
+                    summary_request, compact_model, cancel=cancel, tools=None):
+                if cancel and cancel.is_set():
+                    return ""
+                if isinstance(chunk, tuple) and len(chunk) == 2:
+                    is_reasoning, text = chunk
+                    if not is_reasoning:
+                        summary_text += text
+        except Exception:
+            return ""
+        return summary_text
+
+    return compact_history(messages, compact_model, summarize)
 
 
 def _create_chat(window, name, initial="",
@@ -814,6 +615,15 @@ def _read_selection(view):
     return content
 
 
+def _initial_chat_text(source_view, system_prompt, user_prompt):
+    messages = [
+        {"role": "developer", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+    _apply_agents_md(messages, source_view)
+    return format_chat(messages)
+
+
 class PromptInputHandler(sublime_plugin.TextInputHandler):
     """Input handler - free-form prompt for AgenticCodeCommand"""
     def placeholder(self):
@@ -835,10 +645,10 @@ class AgenticCodeCommand(sublime_plugin.WindowCommand):
         content = _read_selection(old)
         user_prompt = "File: {}\n```\n{}\n```\n{}".format(
             old.file_name(), content, prompt)
-        new_chat = "# --- System ---\n{}\n\n# --- User ---\n{}\n".format(
+        new_chat = _initial_chat_text(
+            old,
             sublime.load_settings("Agentic.sublime-settings").get("default_prompt"),
-            user_prompt
-        )
+            user_prompt) + "\n"
 
         view = _create_chat(self.window, "Chat " + prompt[:12],
                             initial=new_chat)
@@ -859,7 +669,7 @@ class AgenticChatCommand(sublime_plugin.WindowCommand):
             return
 
         if view.settings().get("agentic_is_streaming"):
-            self.window.run_command("cancel_stream")
+            self.window.run_command("agentic_cancel_stream")
             return
 
         text = view.substr(sublime.Region(0, view.size()))
@@ -868,6 +678,9 @@ class AgenticChatCommand(sublime_plugin.WindowCommand):
             sublime.status_message("Chat data not found")
             self.window.run_command("agent_new_chat")
             return
+        if _apply_agents_md(messages, view):
+            view.run_command("select_all")
+            view.run_command("insert", {"characters": _rebuild_text(messages)})
 
         view.settings().set("agentic_is_streaming", True)
         view.settings().set("agentic_is_chat", True)
@@ -882,9 +695,10 @@ class AgenticNewChatCommand(sublime_plugin.WindowCommand):
     def run(self):
         if not self.window.active_view():
             return
-        new_chat = "# --- System ---\n{}\n\n# --- User ---\n".format(
-            sublime.load_settings("Agentic.sublime-settings").get("default_prompt")
-        )
+        new_chat = _initial_chat_text(
+            self.window.active_view(),
+            sublime.load_settings("Agentic.sublime-settings").get("default_prompt"),
+            "") + "\n"
         view = _create_chat(self.window, "Chat", new_chat, create_pane=False)
 
 
@@ -913,7 +727,8 @@ class AgenticCancelStreamCommand(sublime_plugin.WindowCommand):
         task = _ACTIVE_STREAMERS.get(view.id())
         if task:
             task.cancel()
-            _printstatus("Streaming cancelled.")
+            _printstatus("{} cancelled.".format(
+                getattr(task, "operation", "Streaming")))
         else:
             view.settings().set("agentic_is_streaming", False)
 
@@ -935,31 +750,69 @@ class AgenticClearReasoningCommand(sublime_plugin.TextCommand):
 
 
 class AgenticCompactCommand(sublime_plugin.WindowCommand):
-    """Compact chat history via LLM summarization, overwriting the view."""
+    """Compact chat history via LLM summarization."""
     def run(self):
         view = self.window.active_view()
-        if not view or not view.settings().get("agentic_is_chat"):
+        if not view:
+            _printstatus("No active view to compact")
             return
         if view.settings().get("agentic_is_streaming"):
-            self.window.run_command("cancel_stream")
+            self.window.run_command("agentic_cancel_stream")
+            return
 
         text = view.substr(sublime.Region(0, view.size()))
         messages = _build_messages_from_text(text)
-        if not messages or len(messages) < 4:
+        if not messages:
+            _printstatus("Chat data not found")
+            return
+        if len(messages) < 4:
+            _printstatus("Chat compaction needs more history")
+            return
+        view.settings().set("agentic_is_chat", True)
+
+        settings = sublime.load_settings("Agentic.sublime-settings")
+        models = settings.get("models") or {}
+        model_name = view.settings().get("agent_model")
+        if not model_name or model_name not in models:
+            model_name = _pick_model()
+        compact_model_name, compact_model = _pick_compact_model(
+            models, model_name)
+        head, middle, tail = split_history(messages, compact_model)
+        if not middle:
+            _printstatus("Chat compaction did not change context")
             return
 
-        models = sublime.load_settings("Agentic.sublime-settings").get("models")
-        model_name = view.settings().get("agent_model")
-        model = models.get(model_name, {}) if model_name else _pick_model()
-        if not model_name:
-            model_name = _pick_model()
-            model = models.get(model_name, {})
+        behavior = settings.get("compact_chat_behavior", "new_chat")
+        stream_to_view = behavior != "replace"
+        target_view = view
+        if stream_to_view:
+            initial = _rebuild_text(clip_tool_outputs(head, compact_model))
+            if initial:
+                initial += "\n\n"
+            initial += "# --- User ---\n" + escape_content(SUMMARY_PREFIX + "\n")
+            target_view = _create_chat(
+                self.window,
+                "Chat compacting",
+                initial,
+                create_pane=False)
+            target_view.settings().set("agent_model", model_name)
 
-        compacted = _compact_history(messages, model)
-        rebuilt = _rebuild_text(compacted)
-        view.run_command("select_all")
-        view.run_command("insert", {"characters": rebuilt + "\n\n# --- User ---\n"})
-        _printstatus("Chat compacted")
+        target_view.settings().set("agentic_is_streaming", True)
+        target_view.settings().set("agentic_is_chat", True)
+        task = AgentCompactionTask(
+            view,
+            target_view,
+            head,
+            middle,
+            tail,
+            model_name,
+            compact_model,
+            behavior,
+            _ACTIVE_STREAMERS,
+            stream_to_view)
+        _ACTIVE_STREAMERS[target_view.id()] = task
+        _printstatus("Compaction starting with {}...".format(compact_model_name))
+        task.start()
 
 
 class AgenticActionCommand(sublime_plugin.WindowCommand):
@@ -997,8 +850,7 @@ class AgenticActionCommand(sublime_plugin.WindowCommand):
         else:
             user_prompt = ""
 
-        new_chat = "# --- System ---\n{}\n\n# --- User ---\n{}".format(
-            system_prompt, user_prompt)
+        new_chat = _initial_chat_text(old, system_prompt, user_prompt)
 
         view = _create_chat(self.window, "Chat " + action_name[:12], new_chat)
 
@@ -1015,7 +867,7 @@ class AgenticActionCommand(sublime_plugin.WindowCommand):
 class AgenticModelChatCommand(sublime_plugin.WindowCommand):
     """Run a user-defined action - see Agentic.sublime-settings"""
     def run(self):
-        self.models = self._load_models()
+        self.models = sublime.load_settings("Agentic.sublime-settings").get("models")
         if not self.models:
             sublime.error_message(
                 "Agentic.sublime-settings contains no models.\n"
@@ -1045,7 +897,8 @@ class AgenticModelChatCommand(sublime_plugin.WindowCommand):
         else:  # empty new chat
             user_prompt = ""
 
-        new_chat = "# --- System ---\n{}\n\n# --- User ---\n{}".format(
+        new_chat = _initial_chat_text(
+            old,
             sublime.load_settings("Agentic.sublime-settings").get("default_prompt"),
             user_prompt)
 
@@ -1053,10 +906,6 @@ class AgenticModelChatCommand(sublime_plugin.WindowCommand):
 
         messages = _build_messages_from_text(new_chat)
         view.settings().set("agent_model", model_name)
-
-    def _load_models(self):
-        return sublime.load_settings("Agentic.sublime-settings").get("models")
-
 
 class AgenticSetModelCommand(sublime_plugin.WindowCommand):
     """Pick a model from your settings and store it in the view."""
@@ -1269,11 +1118,10 @@ class AgenticInsertFileCommand(sublime_plugin.WindowCommand):
         # Language hint for markdown fence (extension without dot)
         lang = os.path.splitext(path)[1].lstrip('.')
         insertion = "\nFile: {}\n```{}\n{}\n```\n".format(
-            path, lang, content)
+            path, lang, escape_content(content))
 
         # Insert at each caret (default behaviour leaves cursor after the text)
         auto_indent = self.view.settings().get('auto_indent', False)
         self.view.settings().set('auto_indent', False)
         self.view.run_command('insert', {'characters': insertion})
         self.view.settings().set('auto_indent', auto_indent)
-
