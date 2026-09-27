@@ -40,7 +40,7 @@
         "command": "agentic_insert_file"
     },
     {
-        "caption": "Preferences: AI Agent Settings",
+        "caption": "Preferences: Agentic AI Agent Settings",
         "command": "edit_settings",
         "args": {
           "base_file": "${packages}/Agentic/Agentic.sublime-settings",
