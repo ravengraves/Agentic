@@ -431,7 +431,13 @@ def _rebuild_text(messages, strip_active=False):
 def _create_chat(window, name, initial="",
                  temporary=True, create_pane=True, pane_dir="right"):
     view = window.new_file()
-    if create_pane:
+    # Use the last group if nondefault layout active
+    if create_pane and (len(window.layout()["cols"]) != 2 or len(window.layout()["rows"]) != 2):
+        last_group = window.num_groups() - 1
+        window.set_view_index(view, last_group, 0)
+        window.focus_group(last_group)
+    # Otherwise, create 2-column layout
+    elif create_pane:
         window.set_layout({
             "cols":  [0.0, 0.5, 1.0],
             "rows":  [0.0, 1.0],
@@ -838,8 +844,16 @@ class AgenticCutCommand(sublime_plugin.TextCommand):
         for region in view.sel():
             delete_regions.append(view.line(region) if region.empty() else region)
 
-        # Delete from the end to the start so offsets don't shift
+        # Deduplicated repeated regions
+        # Delete from the end to the start so offsets don't shift; skip repeats
+        deduplicated = []
         for region in sorted(delete_regions, key=lambda r: r.begin(), reverse=True):
+            if len(deduplicated) and deduplicated[-1].intersects(region):
+                deduplicated[-1] = deduplicated[-1].cover(region)
+            else:
+                deduplicated.append(region)
+
+        for region in deduplicated:
             view.erase(edit, region)
 
         # Status feedback
@@ -869,12 +883,12 @@ class AgenticInsertFileCommand(sublime_plugin.WindowCommand):
                     self._paths.append(full)
                     self._names.append(rel)
 
+        if not self._paths:
+            return
+
         self._names, self._paths = zip(
             *sorted(zip(self._names, self._paths), key=lambda x: x[1])
         )
-
-        if not self._paths:
-            return
 
         # Let the user pick a file
         self.window.show_quick_panel(self._names, self._on_done)
